@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "functions": {
+    "api/*.js": {
+      "runtime": "nodejs20.x"
+    }
+  },
+  "crons": [
+    { "path": "/api/scan", "schedule": "*/2 * * * *" },
+    { "path": "/api/daily-summary", "schedule": "0 0 * * *" }
+  ]
+}

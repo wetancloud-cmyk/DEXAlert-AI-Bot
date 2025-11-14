@@ -1,12 +1,56 @@
 const { Telegraf, Markup } = require('telegraf');
 const fetch = require('node-fetch');
-const { QuickDB } = require('quick.db');
-const db = new QuickDB();
+const { createClient } = require('@supabase/supabase-js');
 const cron = require('node-cron');
 require('dotenv').config();
 
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+const DB_TABLE = 'bot_users';
+
+const db = {
+  async get(path) {
+    const m = path.match(/^user_(.+?)(?:\.(.+))?$/);
+    if (!m) return null;
+    const userId = m[1];
+    const { data } = await supabase.from(DB_TABLE).select('data').eq('user_id', userId).single();
+    const obj = data?.data || {};
+    if (!m[2]) return obj;
+    return m[2].split('.').reduce((acc, key) => (acc && acc[key] !== undefined ? acc[key] : undefined), obj);
+  },
+  async set(path, value) {
+    const m = path.match(/^user_(.+?)(?:\.(.+))?$/);
+    if (!m) return null;
+    const userId = m[1];
+    const { data } = await supabase.from(DB_TABLE).select('data').eq('user_id', userId).single();
+    const obj = data?.data || {};
+    const keys = m[2] ? m[2].split('.') : [];
+    let ref = obj;
+    for (let i = 0; i < keys.length - 1; i++) {
+      if (typeof ref[keys[i]] !== 'object' || ref[keys[i]] === null) ref[keys[i]] = {};
+      ref = ref[keys[i]];
+    }
+    if (keys.length) ref[keys[keys.length - 1]] = value; else Object.assign(obj, value);
+    await supabase.from(DB_TABLE).upsert({ user_id: userId, data: obj });
+    return value;
+  },
+  async push(path, value) {
+    const arr = (await this.get(path)) || [];
+    arr.push(value);
+    await this.set(path, arr);
+    return arr;
+  },
+  async all() {
+    const { data } = await supabase.from(DB_TABLE).select('user_id');
+    return (data || []).map(row => ({ id: `user_${row.user_id}` }));
+  }
+};
+
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const TAAPI = process.env.TAAPI_IO_SECRET;
+bot.catch((err, ctx) => {
+  console.error('Bot error:', err);
+  try { ctx.answerCbQuery?.('Error occurred'); } catch {}
+});
 
 let taapiCount = 0;
 const MAX_TAAPI = 90;
@@ -474,8 +518,8 @@ bot.action(/^preset_(.+)$/, async ctx => {
     return ctx.answerCbQuery('Create a watchlist first!', { show_alert: true });
   }
 
-  const wlButtons = lists.map(name => 
-    [Markup.button.callback(`Enable for: ${name}`, `enable_${presetKey}_${Buffer.from(name).toString('base64')}`)]
+  const wlButtons = lists.map((name, i) => 
+    [Markup.button.callback(`Enable for: ${name}`, `enable_${presetKey}_${i}`)]
   );
   wlButtons.push([Markup.button.callback('« Back', 'alert_presets')]);
 
@@ -488,9 +532,17 @@ bot.action(/^preset_(.+)$/, async ctx => {
 });
 
 bot.action(/^enable_(.+)_(.+)$/, async ctx => {
-  const [presetKey, encodedName] = [ctx.match[1], ctx.match[2]];
-  const wlName = Buffer.from(encodedName, 'base64').toString();
+  const presetKey = ctx.match[1];
+  const idx = parseInt(ctx.match[2], 10);
   const preset = ALERT_PRESETS[presetKey];
+
+  const data = await db.get(`user_${ctx.from.id}`);
+  const lists = Object.keys(data?.watchlists || {});
+  const wlName = lists[idx];
+
+  if (!preset || !wlName) {
+    return ctx.answerCbQuery('Invalid selection', { show_alert: true });
+  }
 
   const alerts = await db.get(`user_${ctx.from.id}.watchlists.${wlName}.alerts`) || [];
   alerts.push({ preset: presetKey, active: true, createdAt: Date.now() });
@@ -1050,6 +1102,18 @@ async function scanAndAlert(userId) {
             }, dexData.currentPrice, alert.preset);
           }
         }
+
+        if (aiEnabled && aiPred) {
+          let aiTriggered = null;
+          if (ALERT_PRESETS.AI_HIGH_CONFIDENCE.condition(ind, priceChange, aiPred)) {
+            aiTriggered = 'AI_HIGH_CONFIDENCE';
+          } else if (ALERT_PRESETS.AI_QUICK_FLIP.condition(ind, priceChange, aiPred)) {
+            aiTriggered = 'AI_QUICK_FLIP';
+          }
+          if (aiTriggered) {
+            await sendAlert(userId, token, ind, aiPred, dexData.currentPrice, aiTriggered);
+          }
+        }
       } catch (e) {
         console.error(`Error scanning ${token.symbol}:`, e);
       }
@@ -1058,32 +1122,36 @@ async function scanAndAlert(userId) {
 }
 
 // === CRON JOBS ===
-cron.schedule('*/2 * * * *', async () => {
-  try {
-    const allData = await db.all();
-    const userIds = allData.filter(item => item.id.startsWith('user_')).map(item => item.id.split('_')[1]);
-    for (const userId of userIds) {
-      await scanAndAlert(userId);
+if (require.main === module) {
+  cron.schedule('*/2 * * * *', async () => {
+    try {
+      const allData = await db.all();
+      const userIds = allData.filter(item => item.id.startsWith('user_')).map(item => item.id.split('_')[1]);
+      for (const userId of userIds) {
+        await scanAndAlert(userId);
+      }
+    } catch (e) {
+      console.error('Cron error:', e);
     }
-  } catch (e) {
-    console.error('Cron error:', e);
-  }
-});
+  });
 
-cron.schedule('0 0 * * *', async () => {
-  try {
-    const allData = await db.all();
-    const userIds = allData.filter(item => item.id.startsWith('user_')).map(item => item.id.split('_')[1]);
-    for (const userId of userIds) {
-      await bot.telegram.sendMessage(userId, '📊 Daily Summary: Use /pnl summary to view your stats!');
+  cron.schedule('0 0 * * *', async () => {
+    try {
+      const allData = await db.all();
+      const userIds = allData.filter(item => item.id.startsWith('user_')).map(item => item.id.split('_')[1]);
+      for (const userId of userIds) {
+        await bot.telegram.sendMessage(userId, '📊 Daily Summary: Use /pnl summary to view your stats!');
+      }
+    } catch (e) {
+      console.error('Daily cron error:', e);
     }
-  } catch (e) {
-    console.error('Daily cron error:', e);
-  }
-});
+  });
 
-bot.launch();
-console.log('🚀 DEX Alert AI Bot v1.0 – RUNNING!');
+  bot.launch();
+  console.log('🚀 DEX Alert AI Bot v1.0 – RUNNING!');
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+  process.once('SIGINT', () => bot.stop('SIGINT'));
+  process.once('SIGTERM', () => bot.stop('SIGTERM'));
+}
+
+module.exports = { bot, scanAndAlert, db };
