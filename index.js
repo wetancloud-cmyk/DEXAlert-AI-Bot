@@ -228,8 +228,18 @@ async function getIndicatorsFromBackfill(candles) {
 }
 
 async function importWatchlistFromURL(userId, name, url) {
-  const id = url.split('/watchlist/')[1];
-  const data = await fetch(`https://api.dexscreener.com/watchlists/v1/${id}`).then(r => r.json());
+  const clean = url.replace(/[`<>]/g, '').trim();
+  const m = clean.match(/watchlist\/([A-Za-z0-9_-]+)/);
+  const id = m ? m[1] : clean;
+  const res = await fetch(`https://api.dexscreener.com/watchlists/v1/${id}`, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+      'Accept': 'application/json'
+    }
+  });
+  if (!res.ok) throw new Error(`DexScreener ${res.status}`);
+  const data = await res.json();
+  if (!data?.pairs || data.pairs.length === 0) throw new Error('Empty watchlist or invalid ID');
   const tokens = data.pairs.map(p => ({
     symbol: p.baseToken.symbol,
     address: p.baseToken.address,
@@ -238,7 +248,7 @@ async function importWatchlistFromURL(userId, name, url) {
     source: 'dex',
     pairAddress: p.pairAddress
   }));
-  await db.set(`user_${userId}.watchlists.${name}`, { url, tokens, lastSync: Date.now(), alerts: [] });
+  await db.set(`user_${userId}.watchlists.${name}`, { url: clean, tokens, lastSync: Date.now(), alerts: [] });
   return tokens;
 }
 
@@ -988,7 +998,8 @@ bot.command('wl', async ctx => {
     await db.set(`user_${ctx.from.id}.watchlists.${name}`, { tokens: [], alerts: [], createdAt: Date.now() });
     ctx.replyWithHTML(`✅ Watchlist <b>"${name}"</b> created!`);
   } else if (action === 'import') {
-    const url = args[1];
+    const raw = args.slice(1).join(' ');
+    const url = raw ? raw.replace(/[`<>]/g, '').trim() : '';
     if (!url || !url.includes('dexscreener.com/watchlist/')) {
       return ctx.reply('Usage: /wl import https://dexscreener.com/watchlist/abc123');
     }
@@ -1002,7 +1013,7 @@ bot.command('wl', async ctx => {
         (tokens.length > 5 ? `\n<i>...and ${tokens.length - 5} more</i>` : '')
       );
     } catch (e) {
-      ctx.reply('❌ Error importing. Check the URL.');
+      ctx.reply(`❌ Error importing. ${e.message || 'Check the URL.'}`);
     }
   } else if (action === 'list') {
     const data = await db.get(`user_${ctx.from.id}`);
