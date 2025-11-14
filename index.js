@@ -148,25 +148,26 @@ async function importWatchlist(userId, name, url) {
 
 // === SEND ALERT ===
 async function sendAlert(userId, token, ind, pred, price) {
-  const badge = token.source === 'dex' ? '[DEX]' : '[MANUAL]';
+  const badge = token.source === 'dex' ? '🔷 DEX' : '✏️ MANUAL';
   const msg = `
-DING DING DING
-${badge} *$${token.symbol}* (${token.chain})
+🔔 *ALERT DETECTED* 🔔
+${badge} | *$${token.symbol}* | ${token.chain}
 
-*RSI 5m:* ${ind.rsi}  
-*MACD:* ${ind.macd}  
-*EMA:* ${ind.ema}
+📊 *Technical Indicators*
+RSI (5m): ${ind.rsi} ${parseFloat(ind.rsi) <= 30 ? '🟢 Oversold' : ''}
+MACD: ${ind.macd}
+EMA: ${ind.ema}
 
-*AI PREDICTION* (Accuracy: ${pred.accuracy}%)
-Entry: $${pred.entry.toFixed(6)}  
-SL: $${pred.sl.toFixed(6)}  
-TP1: $${pred.tp1.toFixed(6)} (${pred.prob1}% to ${pred.time1})  
-TP2: $${pred.tp2.toFixed(6)} (${pred.prob2}% to ${pred.time2})  
-Duration: ${pred.duration}
+🤖 *AI PREDICTION* (${pred.accuracy}% Accuracy)
+💰 Entry: $${pred.entry.toFixed(6)}
+🛑 Stop Loss: $${pred.sl.toFixed(6)}
+🎯 TP1: $${pred.tp1.toFixed(6)} (${pred.prob1}% in ${pred.time1})
+🚀 TP2: $${pred.tp2.toFixed(6)} (${pred.prob2}% in ${pred.time2})
+⏱ Duration: ${pred.duration}
 
 [Trade Now](https://t.me/basedbot_bot?start=trade_${token.address})  
 [Copy Address] \`${token.address}\`  
-[DexScreener](${token.url})
+[View Chart](${token.url})
   `.trim();
 
   await bot.telegram.sendMessage(userId, msg, {
@@ -197,63 +198,292 @@ async function scanAndAlert(userId) {
 }
 
 // === COMMANDS ===
-bot.start(ctx => ctx.replyWithHTML(`
-<b>DEXAlert AI Bot v0.1</b>
+bot.start(ctx => {
+  const buttons = Markup.inlineKeyboard([
+    [Markup.button.callback('📋 Features', 'features'), Markup.button.callback('📖 Commands', 'help')],
+    [Markup.button.callback('🤖 Enable AI', 'ai_on'), Markup.button.callback('📥 Import Watchlist', 'import')]
+  ]);
+  
+  return ctx.replyWithHTML(
+    `🚀 <b>DEX Alert AI Bot v0.1</b>
 
-Features: DEX Support • AI DeepSeek • Wallet PnL
-Type /help
-`));
+Welcome! I help you find profitable memecoin trades with:
 
-bot.command('help', ctx => ctx.replyWithHTML(`
-/createwl Name  
-/usewl Name  
-/import to send link  
-/addmanual $NAME ADDRESS PAIR_ADDRESS  
-/connect 7xKj... [Label]  
-/setalert [Name]  
-/ai on/off  
-/pnl  
-/export  
-/whitelist add BONK
-`));
+✨ <b>Features</b>
+🔷 DEX monitoring (DexScreener)
+🤖 AI predictions (DeepSeek 3.1)
+📊 Technical analysis (RSI, MACD, EMA)
+💰 Wallet PnL tracking
+🔔 Smart alerts (every 2 min)
+
+👇 Get started below!`,
+    buttons
+  );
+});
+
+bot.action('features', ctx => {
+  ctx.answerCbQuery();
+  return ctx.editMessageText(
+    `✨ <b>Features</b>\n\n` +
+    `🔷 <b>DEX Support</b>\n` +
+    `Monitor any token on decentralized exchanges\n\n` +
+    `🤖 <b>AI Predictions</b>\n` +
+    `Get entry/exit points with probability & timing\n\n` +
+    `📊 <b>Technical Analysis</b>\n` +
+    `RSI, MACD, EMA indicators in real-time\n\n` +
+    `🔔 <b>Auto Alerts</b>\n` +
+    `Get notified when RSI < 30 (oversold)\n\n` +
+    `💰 <b>PnL Tracking</b>\n` +
+    `Connect wallet to track your profits`,
+    { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('« Back', 'back')]]) }
+  );
+});
+
+bot.action('help', ctx => {
+  ctx.answerCbQuery();
+  return ctx.editMessageText(
+    `📖 <b>Commands</b>\n\n` +
+    `<b>Watchlist Management</b>\n` +
+    `/createwl MyList - Create new watchlist\n` +
+    `/usewl MyList - Switch to a watchlist\n` +
+    `/import - Import from DexScreener\n` +
+    `   <i>Example: Send DexScreener link after /import</i>\n\n` +
+    `<b>Add Tokens</b>\n` +
+    `/addmanual $BONK 0x7xKj... pair_address\n` +
+    `   <i>Add token manually with symbol & addresses</i>\n\n` +
+    `<b>AI & Alerts</b>\n` +
+    `/ai on - Enable AI alerts\n` +
+    `/ai off - Disable AI alerts\n` +
+    `/blacklist add DOGE - Block token alerts\n` +
+    `/blacklist remove DOGE - Unblock token\n\n` +
+    `<b>Wallet & Stats</b>\n` +
+    `/connect 7xKj... MyWallet - Connect wallet\n` +
+    `/pnl - View profit/loss stats\n` +
+    `/export - Download trade history CSV`,
+    { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('« Back', 'back')]]) }
+  );
+});
+
+bot.action('ai_on', async ctx => {
+  ctx.answerCbQuery('AI Alerts Enabled! 🤖');
+  await db.set(`user_${ctx.from.id}.ai.enabled`, true);
+  return ctx.editMessageText(
+    `✅ <b>AI Alerts Enabled!</b>\n\n` +
+    `Now import a watchlist:\n` +
+    `1. Type /import\n` +
+    `2. Send your DexScreener watchlist link\n` +
+    `3. I'll start scanning every 2 minutes!\n\n` +
+    `<i>You'll get alerts when RSI drops below 30</i>`,
+    { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('« Back', 'back')]]) }
+  );
+});
+
+bot.action('import', ctx => {
+  ctx.answerCbQuery();
+  return ctx.editMessageText(
+    `📥 <b>Import Watchlist</b>\n\n` +
+    `Send me your DexScreener watchlist link\n\n` +
+    `<b>Example:</b>\n` +
+    `https://dexscreener.com/watchlist/abc123\n\n` +
+    `<i>How to get it:</i>\n` +
+    `1. Go to DexScreener\n` +
+    `2. Open your watchlist\n` +
+    `3. Copy the URL\n` +
+    `4. Send it here`,
+    { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('« Back', 'back')]]) }
+  );
+});
+
+bot.action('back', ctx => {
+  ctx.answerCbQuery();
+  const buttons = Markup.inlineKeyboard([
+    [Markup.button.callback('📋 Features', 'features'), Markup.button.callback('📖 Commands', 'help')],
+    [Markup.button.callback('🤖 Enable AI', 'ai_on'), Markup.button.callback('📥 Import Watchlist', 'import')]
+  ]);
+  
+  return ctx.editMessageText(
+    `🚀 <b>DEX Alert AI Bot v0.1</b>\n\n` +
+    `Welcome! I help you find profitable memecoin trades with:\n\n` +
+    `✨ <b>Features</b>\n` +
+    `🔷 DEX monitoring (DexScreener)\n` +
+    `🤖 AI predictions (DeepSeek 3.1)\n` +
+    `📊 Technical analysis (RSI, MACD, EMA)\n` +
+    `💰 Wallet PnL tracking\n` +
+    `🔔 Smart alerts (every 2 min)\n\n` +
+    `👇 Get started below!`,
+    { parse_mode: 'HTML', ...buttons }
+  );
+});
+
+bot.command('help', ctx => {
+  return ctx.replyWithHTML(
+    `📖 <b>Commands</b>\n\n` +
+    `<b>Watchlist Management</b>\n` +
+    `/createwl MyList - Create new watchlist\n` +
+    `/usewl MyList - Switch to a watchlist\n` +
+    `/import - Import from DexScreener\n` +
+    `   <i>Example: Send DexScreener link after /import</i>\n\n` +
+    `<b>Add Tokens</b>\n` +
+    `/addmanual $BONK 0x7xKj... pair_address\n` +
+    `   <i>Add token manually with symbol & addresses</i>\n\n` +
+    `<b>AI & Alerts</b>\n` +
+    `/ai on - Enable AI alerts\n` +
+    `/ai off - Disable AI alerts\n` +
+    `/blacklist add DOGE - Block token alerts\n` +
+    `/blacklist remove DOGE - Unblock token\n\n` +
+    `<b>Wallet & Stats</b>\n` +
+    `/connect 7xKj... MyWallet - Connect wallet\n` +
+    `/pnl - View profit/loss stats\n` +
+    `/export - Download trade history CSV`
+  );
+});
 
 bot.command('createwl', async (ctx) => {
   const name = ctx.message.text.split(' ').slice(1).join(' ');
+  if (!name) {
+    return ctx.replyWithHTML(
+      `❌ Please provide a name!\n\n` +
+      `<b>Example:</b>\n` +
+      `/createwl MyMemeCoins`
+    );
+  }
   await db.set(`user_${ctx.from.id}.watchlists.${name}`, { tokens: [] });
-  ctx.reply(`Watchlist "${name}" created!`);
+  ctx.replyWithHTML(`✅ Watchlist <b>"${name}"</b> created!\n\nUse /usewl ${name} to activate it.`);
 });
 
-bot.command('import', ctx => ctx.reply('Send DexScreener watchlist link:'));
+bot.command('usewl', async (ctx) => {
+  const name = ctx.message.text.split(' ').slice(1).join(' ');
+  if (!name) {
+    const data = await db.get(`user_${ctx.from.id}`);
+    const lists = Object.keys(data?.watchlists || {});
+    return ctx.replyWithHTML(
+      `📋 <b>Your Watchlists:</b>\n\n` +
+      (lists.length > 0 ? lists.map(l => `• ${l}`).join('\n') : '<i>No watchlists yet</i>') +
+      `\n\n<b>Usage:</b> /usewl MyList`
+    );
+  }
+  await db.set(`user_${ctx.from.id}.activeWatchlist`, name);
+  ctx.replyWithHTML(`✅ Switched to <b>"${name}"</b>`);
+});
+
+bot.command('import', ctx => ctx.replyWithHTML(
+  `📥 <b>Import Watchlist</b>\n\n` +
+  `Send me your DexScreener watchlist link\n\n` +
+  `<b>Example:</b>\n` +
+  `https://dexscreener.com/watchlist/abc123`
+));
 
 bot.hears(/^https:\/\/dexscreener\.com\/watchlist\/.+/, async (ctx) => {
   const url = ctx.message.text;
   const name = `WL_${Date.now()}`;
-  await importWatchlist(ctx.from.id, name, url);
-  await db.set(`user_${ctx.from.id}.activeWatchlist`, name);
-  ctx.reply(`Imported! Type /status`);
+  try {
+    const tokens = await importWatchlist(ctx.from.id, name, url);
+    await db.set(`user_${ctx.from.id}.activeWatchlist`, name);
+    ctx.replyWithHTML(
+      `✅ <b>Watchlist Imported!</b>\n\n` +
+      `📊 <b>${tokens.length}</b> tokens added\n` +
+      `📋 Name: <b>${name}</b>\n\n` +
+      `${tokens.slice(0, 5).map(t => `• $${t.symbol} (${t.chain})`).join('\n')}` +
+      (tokens.length > 5 ? `\n<i>...and ${tokens.length - 5} more</i>` : '') +
+      `\n\n🤖 Enable AI with /ai on to start receiving alerts!`
+    );
+  } catch (e) {
+    ctx.reply(`❌ Error importing watchlist. Please check the URL.`);
+  }
 });
 
 bot.command('ai', async (ctx) => {
-  const enabled = ctx.message.text.includes('on');
+  const args = ctx.message.text.split(' ').slice(1);
+  if (args.length === 0) {
+    const status = await db.get(`user_${ctx.from.id}.ai.enabled`);
+    return ctx.replyWithHTML(
+      `🤖 <b>AI Alerts Status:</b> ${status ? '✅ ON' : '❌ OFF'}\n\n` +
+      `<b>Usage:</b>\n` +
+      `/ai on - Enable alerts\n` +
+      `/ai off - Disable alerts`
+    );
+  }
+  const enabled = args[0].toLowerCase() === 'on';
   await db.set(`user_${ctx.from.id}.ai.enabled`, enabled);
-  ctx.reply(`AI: ${enabled ? 'ON' : 'OFF'}`);
+  ctx.replyWithHTML(
+    enabled 
+      ? `✅ <b>AI Alerts Enabled!</b>\n\n🔔 You'll get notified when:\n• RSI drops below 30 (oversold)\n• AI sees good entry opportunities\n\n⏱ Scanning every 2 minutes`
+      : `❌ <b>AI Alerts Disabled</b>\n\nYou won't receive any alerts until you turn it back on.`
+  );
+});
+
+bot.command('blacklist', async (ctx) => {
+  const args = ctx.message.text.split(' ').slice(1);
+  const action = args[0];
+  const symbol = args[1];
+  
+  if (!action || !symbol) {
+    const blacklist = await db.get(`user_${ctx.from.id}.blacklist`) || [];
+    return ctx.replyWithHTML(
+      `🚫 <b>Blacklist</b>\n\n` +
+      (blacklist.length > 0 
+        ? `Blocked tokens:\n${blacklist.map(s => `• $${s}`).join('\n')}` 
+        : `<i>No tokens blocked</i>`) +
+      `\n\n<b>Usage:</b>\n` +
+      `/blacklist add DOGE\n` +
+      `/blacklist remove DOGE`
+    );
+  }
+  
+  const blacklist = await db.get(`user_${ctx.from.id}.blacklist`) || [];
+  
+  if (action === 'add') {
+    if (!blacklist.includes(symbol)) {
+      blacklist.push(symbol);
+      await db.set(`user_${ctx.from.id}.blacklist`, blacklist);
+      ctx.replyWithHTML(`✅ <b>$${symbol}</b> added to blacklist\n\n🚫 You won't receive alerts for this token.`);
+    } else {
+      ctx.reply(`$${symbol} is already blacklisted.`);
+    }
+  } else if (action === 'remove') {
+    const index = blacklist.indexOf(symbol);
+    if (index > -1) {
+      blacklist.splice(index, 1);
+      await db.set(`user_${ctx.from.id}.blacklist`, blacklist);
+      ctx.replyWithHTML(`✅ <b>$${symbol}</b> removed from blacklist`);
+    } else {
+      ctx.reply(`$${symbol} is not in your blacklist.`);
+    }
+  }
 });
 
 bot.command('connect', async (ctx) => {
   const [addr, ...label] = ctx.message.text.split(' ').slice(1);
+  if (!addr) {
+    return ctx.replyWithHTML(
+      `💰 <b>Connect Wallet</b>\n\n` +
+      `<b>Usage:</b>\n` +
+      `/connect YOUR_ADDRESS [Label]\n\n` +
+      `<b>Example:</b>\n` +
+      `/connect 7xKj...9dF2 MainWallet`
+    );
+  }
   const l = label.join(' ') || addr.slice(0, 8);
   await db.push(`user_${ctx.from.id}.wallets`, { address: addr, label: l });
-  ctx.reply(`Wallet ${l} connected!`);
+  ctx.replyWithHTML(`✅ Wallet <b>${l}</b> connected!\n\n💰 Use /pnl to view stats`);
 });
 
 bot.command('pnl', async (ctx) => {
-  ctx.reply('PnL: Simulated +$1,842 (7/9 wins)');
+  ctx.replyWithHTML(
+    `💰 <b>Profit & Loss</b>\n\n` +
+    `📊 Total PnL: <b>+$1,842</b>\n` +
+    `✅ Wins: 7\n` +
+    `❌ Losses: 2\n` +
+    `📈 Win Rate: <b>77.8%</b>\n\n` +
+    `<i>Note: Currently showing simulated data</i>`
+  );
 });
 
 bot.command('export', async (ctx) => {
+  ctx.replyWithHTML(`📤 <b>Exporting trade history...</b>`);
   ctx.replyWithDocument({ 
-    source: Buffer.from('Token,Entry,TP1\n$BOOMER,0.000069,0.000083'), 
-    filename: 'history.csv' 
+    source: Buffer.from('Token,Entry,TP1,Result\n$BOOMER,0.000069,0.000083,+20%\n$PEPE,0.000012,0.000015,+25%'), 
+    filename: 'trade_history.csv' 
   });
 });
 
