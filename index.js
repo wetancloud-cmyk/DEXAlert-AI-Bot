@@ -59,7 +59,7 @@ const ALERT_PRESETS = {
     condition: (ind, priceChange, aiPred) => {
       if (!aiPred) return false;
       const gainPercent = ((aiPred.tp1 - aiPred.entry) / aiPred.entry) * 100;
-      return gainPercent >= 15 && aiPred.time1.includes('15') || aiPred.time1.includes('30');
+      return gainPercent >= 15 && (aiPred.time1.includes('15') || aiPred.time1.includes('30'));
     }
   }
 };
