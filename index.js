@@ -362,6 +362,7 @@ function getMainMenu() {
 bot.start((ctx) => {
   ctx.replyWithHTML(
     `🚀 <b>DEX Alert AI Bot v1.0</b>
+<i>UI v1.1 Settings</i>
 
 Welcome! I help you find profitable memecoin trades with:
 
@@ -381,7 +382,7 @@ Welcome! I help you find profitable memecoin trades with:
 bot.action("back_main", (ctx) => {
   ctx.answerCbQuery();
   ctx.editMessageText(
-    `🚀 <b>DEX Alert AI Bot v1.0</b>\n\nWelcome! I help you find profitable memecoin trades with:\n\n✨ <b>Features</b>\n🔷 DEX monitoring (DexScreener)\n🤖 AI predictions (DeepSeek 3.1)\n📊 9 Alert presets + custom alerts\n💰 Wallet & PnL tracking\n🔔 Smart alerts (every 2 min)\n\n👇 Choose an option below:`,
+    `🚀 <b>DEX Alert AI Bot v1.0</b>\n<i>UI v1.1 Settings</i>\n\nWelcome! I help you find profitable memecoin trades with:\n\n✨ <b>Features</b>\n🔷 DEX monitoring (DexScreener)\n🤖 AI predictions (DeepSeek 3.1)\n📊 9 Alert presets + custom alerts\n💰 Wallet & PnL tracking\n🔔 Smart alerts (every 2 min)\n\n👇 Choose an option below:`,
     { parse_mode: "HTML", ...getMainMenu() }
   );
 });
