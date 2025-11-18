@@ -1,4 +1,4 @@
-# DEX Alert AI Bot v1.0
+# DEX Alert AI Bot v1.0.2
 
 ## Overview
 A Telegram bot that monitors decentralized exchange (DEX) tokens and sends AI-powered trading alerts based on technical indicators. Features a complete menu system with nested navigation and 9 preset alert types.

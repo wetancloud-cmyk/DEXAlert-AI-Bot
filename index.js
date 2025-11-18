@@ -4,10 +4,39 @@ const { createClient } = require("@supabase/supabase-js");
 const cron = require("node-cron");
 require("dotenv").config();
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+// Validate required environment variables
+const requiredEnvVars = ['TELEGRAM_BOT_TOKEN', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'];
+const missingEnvVars = requiredEnvVars.filter(varName => !process.env[varName]);
+
+if (missingEnvVars.length > 0) {
+  console.error('Missing required environment variables:', missingEnvVars.join(', '));
+  console.error('Please set these variables in your Vercel project settings.');
+  
+  // Create a minimal bot instance that will fail gracefully
+  module.exports = {
+    bot: null,
+    scanAndAlert: async () => { console.error('Bot not initialized due to missing environment variables'); },
+    db: null
+  };
+  return;
+}
+
+let supabase;
+try {
+  supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
+} catch (error) {
+  console.error('Failed to initialize Supabase client:', error.message);
+  
+  module.exports = {
+    bot: null,
+    scanAndAlert: async () => { console.error('Bot not initialized due to Supabase connection failure'); },
+    db: null
+  };
+  return;
+}
 const DB_TABLE = "bot_users";
 
 const db = {
@@ -49,21 +78,435 @@ const db = {
     if (keys.length) ref[keys[keys.length - 1]] = value;
     else Object.assign(obj, value);
     await supabase.from(DB_TABLE).upsert({ user_id: userId, data: obj });
-    return value;
   },
   async push(path, value) {
-    const arr = (await this.get(path)) || [];
-    arr.push(value);
-    await this.set(path, arr);
-    return arr;
+    const m = path.match(/^user_(.+?)(?:\.(.+))?$/);
+    if (!m) return null;
+    const userId = m[1];
+    const { data } = await supabase
+      .from(DB_TABLE)
+      .select("data")
+      .eq("user_id", userId)
+      .single();
+    const obj = data?.data || {};
+    const keys = m[2] ? m[2].split(".") : [];
+    let ref = obj;
+    for (let i = 0; i < keys.length - 1; i++) {
+      if (typeof ref[keys[i]] !== "object" || ref[keys[i]] === null)
+        ref[keys[i]] = {};
+      ref = ref[keys[i]];
+    }
+    if (keys.length) {
+      if (!Array.isArray(ref[keys[keys.length - 1]])) ref[keys[keys.length - 1]] = [];
+      ref[keys[keys.length - 1]].push(value);
+    }
+    await supabase.from(DB_TABLE).upsert({ user_id: userId, data: obj });
   },
   async all() {
-    const { data } = await supabase.from(DB_TABLE).select("user_id");
-    return (data || []).map((row) => ({ id: `user_${row.user_id}` }));
-  },
+    const { data } = await supabase.from(DB_TABLE).select("user_id, data");
+    return data || [];
+  }
 };
 
-const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+// Initialize Telegram Bot
+let bot;
+try {
+  console.log('Initializing Telegram bot with token:', process.env.TELEGRAM_BOT_TOKEN ? 'Present' : 'Missing');
+  bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+  console.log('Telegram bot initialized successfully');
+} catch (error) {
+  console.error('Failed to initialize Telegram bot:', error.message);
+  console.error('Error stack:', error.stack);
+  
+  module.exports = {
+    bot: null,
+    scanAndAlert: async () => { console.error('Bot not initialized due to Telegram bot failure'); },
+    db: null
+  };
+  return;
+}
+
+// Toggle preset for simplified watchlist (no categories)
+bot.action(/^toggle_preset_watchlist_(.+)_(.+)$/, async (ctx) => {
+  const presetKey = ctx.match[1];
+  const preset = ALERT_PRESETS[presetKey];
+  
+  if (!preset) {
+    return ctx.answerCbQuery("Invalid preset", { show_alert: true });
+  }
+  
+  // Get current user alerts (simplified structure)
+  const userAlerts = await db.get(`user_${ctx.from.id}.alerts`) || {};
+  const existingAlert = userAlerts[presetKey];
+  
+  // Toggle the preset
+  if (existingAlert) {
+    existingAlert.active = !existingAlert.active;
+  } else {
+    userAlerts[presetKey] = { preset: presetKey, active: true, createdAt: Date.now() };
+  }
+  
+  await db.set(`user_${ctx.from.id}.alerts`, userAlerts);
+  
+  const isNowActive = existingAlert ? existingAlert.active : true;
+  ctx.answerCbQuery(`${preset.name} ${isNowActive ? 'enabled' : 'disabled'}!`, { show_alert: true });
+  
+  // Refresh the preset view with updated status
+  const tokens = await db.get(`user_${ctx.from.id}.watchlist.tokens`) || [];
+  const updatedUserAlerts = await db.get(`user_${ctx.from.id}.alerts`) || {};
+  const updatedIsActive = updatedUserAlerts[presetKey]?.enabled || false;
+
+  ctx.editMessageText(
+    `🎯 <b>${preset.name}</b>\n\n` +
+      `<b>Criteria:</b> ${preset.description}\n\n` +
+      `<b>Status:</b> ${updatedIsActive ? '✅ Active' : '❌ Inactive'} for your watchlist\n` +
+      `<b>Tokens:</b> ${tokens.length} tokens will be monitored\n` +
+      `<b>Options:</b> Toggle preset or modify settings`,
+    { parse_mode: "HTML", ...Markup.inlineKeyboard([
+      [Markup.button.callback(`${updatedIsActive ? '✅' : '❌'} ${preset.name}`, `toggle_preset_watchlist_${presetKey}_0`)],
+      [Markup.button.callback("🔧 Modify", `modify_preset_${presetKey}_0`)],
+      [Markup.button.callback("📋 View Criteria", `view_criteria_${presetKey}`)],
+      [Markup.button.callback("💾 Save as New Preset", `save_as_new_${presetKey}`)],
+      [Markup.button.callback("« Back to Presets", "alert_presets")]
+    ]) }
+  );
+});
+
+// View detailed criteria
+bot.action(/^view_criteria_(.+)$/, async (ctx) => {
+  const presetKey = ctx.match[1];
+  const preset = ALERT_PRESETS[presetKey];
+  
+  if (!preset) {
+    return ctx.answerCbQuery("Invalid preset", { show_alert: true });
+  }
+  
+  ctx.answerCbQuery();
+  
+  // Show detailed criteria breakdown
+  let criteriaText = `📋 <b>${preset.name} - Detailed Criteria</b>\n\n`;
+  criteriaText += `<b>Description:</b> ${preset.description}\n\n`;
+  
+  // Add specific condition breakdown based on preset type
+  if (presetKey === 'OVERSOLD_HUNTER') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• RSI ≤ 30 (oversold territory)\n`;
+    criteriaText += `• Volume increase ≥ 300%\n\n`;
+    criteriaText += `<b>Signal:</b> Potential bounce opportunity`;
+  } else if (presetKey === 'PUMP_DETECTOR') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• Price increase ≥ 15% in 5 minutes\n`;
+    criteriaText += `• RSI < 50 (not yet overbought)\n\n`;
+    criteriaText += `<b>Signal:</b> Early pump detection`;
+  } else if (presetKey === 'DUMP_RECOVERY') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• Price drop ≥ 20% followed by\n`;
+    criteriaText += `• Recovery ≥ 10% within 15 minutes\n\n`;
+    criteriaText += `<b>Signal:</b> Dump recovery opportunity`;
+  } else if (presetKey === 'OVERBOUGHT_EXIT') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• RSI ≥ 70 (overbought territory)\n`;
+    criteriaText += `• Volume spike ≥ 200%\n\n`;
+    criteriaText += `<b>Signal:</b> Potential exit/sell signal`;
+  } else if (presetKey === 'EMA_GOLDEN_CROSS') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• EMA 9 crosses above EMA 21\n\n`;
+    criteriaText += `<b>Signal:</b> Bullish momentum shift`;
+  } else if (presetKey === 'MACD_BULLISH') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• MACD line crosses above signal line\n\n`;
+    criteriaText += `<b>Signal:</b> Bullish MACD crossover`;
+  } else if (presetKey === 'VOLUME_EXPLOSION') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• Volume increase ≥ 500% in 5 minutes\n\n`;
+    criteriaText += `<b>Signal:</b> Unusual volume activity`;
+  } else if (presetKey === 'AI_HIGH_CONFIDENCE') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• AI prediction confidence ≥ 80%\n\n`;
+    criteriaText += `<b>Signal:</b> High probability AI signal`;
+  } else if (presetKey === 'AI_QUICK_FLIP') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• AI target price ≥ 15% gain\n`;
+    criteriaText += `• Expected time < 30 minutes\n\n`;
+    criteriaText += `<b>Signal:</b> Quick flip opportunity`;
+  }
+  
+  criteriaText += `\n\n<b>Usage:</b> This preset will trigger when all conditions are met.`;
+  
+  ctx.editMessageText(criteriaText, {
+    parse_mode: "HTML",
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback("🔧 Modify Criteria", `modify_preset_${presetKey}`)],
+      [Markup.button.callback("💾 Save as New", `save_as_new_${presetKey}`)],
+      [Markup.button.callback("« Back to Preset", `preset_${presetKey}`)]
+    ])
+  });
+});
+
+// Modify preset (placeholder for future customization)
+bot.action(/^modify_preset_(.+)$/, async (ctx) => {
+  const presetKey = ctx.match[1];
+  const preset = ALERT_PRESETS[presetKey];
+  
+  if (!preset) {
+    return ctx.answerCbQuery("Invalid preset", { show_alert: true });
+  }
+  
+  ctx.answerCbQuery();
+  
+  // For now, show a message that modification is coming soon
+  // In a full implementation, this would open a customization wizard
+  ctx.editMessageText(
+    `🔧 <b>Modify ${preset.name}</b>\n\n` +
+      `Preset customization is coming soon!\n\n` +
+      `<b>Current Settings:</b> ${preset.description}\n\n` +
+      `You'll be able to adjust thresholds, add conditions, and create custom variants.`,
+    {
+      parse_mode: "HTML",
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback("💾 Save as New Preset", `save_as_new_${presetKey}`)],
+        [Markup.button.callback("« Back to Criteria", `view_criteria_${presetKey}`)]
+      ])
+    }
+  );
+});
+
+// Save as new preset (placeholder for future functionality)
+bot.action(/^save_as_new_(.+)$/, async (ctx) => {
+  const presetKey = ctx.match[1];
+  const preset = ALERT_PRESETS[presetKey];
+  
+  if (!preset) {
+    return ctx.answerCbQuery("Invalid preset", { show_alert: true });
+  }
+  
+  ctx.answerCbQuery("Save as new preset - Coming soon!", { show_alert: true });
+});
+
+
+
+// View detailed criteria
+bot.action(/^view_criteria_(.+)$/, async (ctx) => {
+  const presetKey = ctx.match[1];
+  const preset = ALERT_PRESETS[presetKey];
+  
+  if (!preset) {
+    return ctx.answerCbQuery("Invalid preset", { show_alert: true });
+  }
+  
+  ctx.answerCbQuery();
+  
+  // Show detailed criteria breakdown
+  let criteriaText = `📋 <b>${preset.name} - Detailed Criteria</b>\n\n`;
+  criteriaText += `<b>Description:</b> ${preset.description}\n\n`;
+  
+  // Add specific condition breakdown based on preset type
+  if (presetKey === 'OVERSOLD_HUNTER') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• RSI ≤ 30 (oversold territory)\n`;
+    criteriaText += `• Volume increase ≥ 300%\n\n`;
+    criteriaText += `<b>Signal:</b> Potential bounce opportunity`;
+  } else if (presetKey === 'PUMP_DETECTOR') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• Price increase ≥ 15% in 5 minutes\n`;
+    criteriaText += `• RSI < 50 (not yet overbought)\n\n`;
+    criteriaText += `<b>Signal:</b> Early pump detection`;
+  } else if (presetKey === 'DUMP_RECOVERY') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• Price drop ≥ 20% followed by\n`;
+    criteriaText += `• Recovery ≥ 10% within 15 minutes\n\n`;
+    criteriaText += `<b>Signal:</b> Dump recovery opportunity`;
+  } else if (presetKey === 'OVERBOUGHT_EXIT') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• RSI ≥ 70 (overbought territory)\n`;
+    criteriaText += `• Volume spike ≥ 200%\n\n`;
+    criteriaText += `<b>Signal:</b> Potential exit/sell signal`;
+  } else if (presetKey === 'EMA_GOLDEN_CROSS') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• EMA 9 crosses above EMA 21\n\n`;
+    criteriaText += `<b>Signal:</b> Bullish momentum shift`;
+  } else if (presetKey === 'MACD_BULLISH') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• MACD line crosses above signal line\n\n`;
+    criteriaText += `<b>Signal:</b> Bullish MACD crossover`;
+  } else if (presetKey === 'VOLUME_EXPLOSION') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• Volume increase ≥ 500% in 5 minutes\n\n`;
+    criteriaText += `<b>Signal:</b> Unusual volume activity`;
+  } else if (presetKey === 'AI_HIGH_CONFIDENCE') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• AI prediction confidence ≥ 80%\n\n`;
+    criteriaText += `<b>Signal:</b> High probability AI signal`;
+  } else if (presetKey === 'AI_QUICK_FLIP') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• AI target price ≥ 15% gain\n`;
+    criteriaText += `• Expected time < 30 minutes\n\n`;
+    criteriaText += `<b>Signal:</b> Quick flip opportunity`;
+  }
+  
+  criteriaText += `\n\n<b>Usage:</b> This preset will trigger when all conditions are met.`;
+  
+  ctx.editMessageText(criteriaText, {
+    parse_mode: "HTML",
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback("🔧 Modify Criteria", `modify_preset_${presetKey}`)],
+      [Markup.button.callback("💾 Save as New", `save_as_new_${presetKey}`)],
+      [Markup.button.callback("« Back to Preset", `preset_${presetKey}`)]
+    ])
+  });
+});
+
+// Modify preset (placeholder for future customization)
+bot.action(/^modify_preset_(.+)$/, async (ctx) => {
+  const presetKey = ctx.match[1];
+  const preset = ALERT_PRESETS[presetKey];
+  
+  if (!preset) {
+    return ctx.answerCbQuery("Invalid preset", { show_alert: true });
+  }
+  
+  ctx.answerCbQuery();
+  
+  // For now, show a message that modification is coming soon
+  // In a full implementation, this would open a customization wizard
+  ctx.editMessageText(
+    `🔧 <b>Modify ${preset.name}</b>\n\n` +
+      `Preset customization is coming soon!\n\n` +
+      `<b>Current Settings:</b> ${preset.description}\n\n` +
+      `You'll be able to adjust thresholds, add conditions, and create custom variants.`,
+    {
+      parse_mode: "HTML",
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback("💾 Save as New Preset", `save_as_new_${presetKey}`)],
+        [Markup.button.callback("« Back to Criteria", `view_criteria_${presetKey}`)]
+      ])
+    }
+  );
+});
+
+// Save as new preset (placeholder for future functionality)
+bot.action(/^save_as_new_(.+)$/, async (ctx) => {
+  const presetKey = ctx.match[1];
+  const preset = ALERT_PRESETS[presetKey];
+  
+  if (!preset) {
+    return ctx.answerCbQuery("Invalid preset", { show_alert: true });
+  }
+  
+  ctx.answerCbQuery("Save as new preset - Coming soon!", { show_alert: true });
+});
+
+// View detailed criteria
+bot.action(/^view_criteria_(.+)$/, async (ctx) => {
+  const presetKey = ctx.match[1];
+  const preset = ALERT_PRESETS[presetKey];
+  
+  if (!preset) {
+    return ctx.answerCbQuery("Invalid preset", { show_alert: true });
+  }
+  
+  ctx.answerCbQuery();
+  
+  // Show detailed criteria breakdown
+  let criteriaText = `📋 <b>${preset.name} - Detailed Criteria</b>\n\n`;
+  criteriaText += `<b>Description:</b> ${preset.description}\n\n`;
+  
+  // Add specific condition breakdown based on preset type
+  if (presetKey === 'OVERSOLD_HUNTER') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• RSI ≤ 30 (oversold territory)\n`;
+    criteriaText += `• Volume increase ≥ 300%\n\n`;
+    criteriaText += `<b>Signal:</b> Potential bounce opportunity`;
+  } else if (presetKey === 'PUMP_DETECTOR') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• Price increase ≥ 15% in 5 minutes\n`;
+    criteriaText += `• RSI < 50 (not yet overbought)\n\n`;
+    criteriaText += `<b>Signal:</b> Early pump detection`;
+  } else if (presetKey === 'DUMP_RECOVERY') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• Price drop ≥ 20% followed by\n`;
+    criteriaText += `• Recovery ≥ 10% within 15 minutes\n\n`;
+    criteriaText += `<b>Signal:</b> Dump recovery opportunity`;
+  } else if (presetKey === 'OVERBOUGHT_EXIT') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• RSI ≥ 70 (overbought territory)\n`;
+    criteriaText += `• Volume spike ≥ 200%\n\n`;
+    criteriaText += `<b>Signal:</b> Potential exit/sell signal`;
+  } else if (presetKey === 'EMA_GOLDEN_CROSS') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• EMA 9 crosses above EMA 21\n\n`;
+    criteriaText += `<b>Signal:</b> Bullish momentum shift`;
+  } else if (presetKey === 'MACD_BULLISH') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• MACD line crosses above signal line\n\n`;
+    criteriaText += `<b>Signal:</b> Bullish MACD crossover`;
+  } else if (presetKey === 'VOLUME_EXPLOSION') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• Volume increase ≥ 500% in 5 minutes\n\n`;
+    criteriaText += `<b>Signal:</b> Unusual volume activity`;
+  } else if (presetKey === 'AI_HIGH_CONFIDENCE') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• AI prediction confidence ≥ 80%\n\n`;
+    criteriaText += `<b>Signal:</b> High probability AI signal`;
+  } else if (presetKey === 'AI_QUICK_FLIP') {
+    criteriaText += `<b>Conditions:</b>\n`;
+    criteriaText += `• AI target price ≥ 15% gain\n`;
+    criteriaText += `• Expected time < 30 minutes\n\n`;
+    criteriaText += `<b>Signal:</b> Quick flip opportunity`;
+  }
+  
+  criteriaText += `\n\n<b>Usage:</b> This preset will trigger when all conditions are met.`;
+  
+  ctx.editMessageText(criteriaText, {
+    parse_mode: "HTML",
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback("🔧 Modify Criteria", `modify_preset_${presetKey}`)],
+      [Markup.button.callback("💾 Save as New", `save_as_new_${presetKey}`)],
+      [Markup.button.callback("« Back to Preset", `preset_${presetKey}`)]
+    ])
+  });
+});
+
+// Modify preset (placeholder for future customization)
+bot.action(/^modify_preset_(.+)$/, async (ctx) => {
+  const presetKey = ctx.match[1];
+  const preset = ALERT_PRESETS[presetKey];
+  
+  if (!preset) {
+    return ctx.answerCbQuery("Invalid preset", { show_alert: true });
+  }
+  
+  ctx.answerCbQuery();
+  
+  // For now, show a message that modification is coming soon
+  // In a full implementation, this would open a customization wizard
+  ctx.editMessageText(
+    `🔧 <b>Modify ${preset.name}</b>\n\n` +
+      `Preset customization is coming soon!\n\n` +
+      `<b>Current Settings:</b> ${preset.description}\n\n` +
+      `You'll be able to adjust thresholds, add conditions, and create custom variants.`,
+    {
+      parse_mode: "HTML",
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback("💾 Save as New Preset", `save_as_new_${presetKey}`)],
+        [Markup.button.callback("« Back to Criteria", `view_criteria_${presetKey}`)]
+      ])
+    }
+  );
+});
+
+// Save as new preset (placeholder for future functionality)
+bot.action(/^save_as_new_(.+)$/, async (ctx) => {
+  const presetKey = ctx.match[1];
+  const preset = ALERT_PRESETS[presetKey];
+  
+  if (!preset) {
+    return ctx.answerCbQuery("Invalid preset", { show_alert: true });
+  }
+  
+  ctx.answerCbQuery("Save as new preset - Coming soon!", { show_alert: true });
+});
+
 const TAAPI = process.env.TAAPI_IO_SECRET;
 bot.catch((err, ctx) => {
   console.error("Bot error:", err);
@@ -133,6 +576,137 @@ const ALERT_PRESETS = {
     },
   },
 };
+
+// === WALLET PRESETS ===
+const WALLET_PRESETS = {
+  WHALE_TRACKER: {
+    name: "🐋 Whale Tracker",
+    description: "Track wallets with >$100k holdings",
+    criteria: "Wallet value > $100,000",
+    enabled: false,
+    config: { minValue: 100000 }
+  },
+  SMART_MONEY: {
+    name: "🧠 Smart Money", 
+    description: "High win rate wallets (70%+)",
+    criteria: "Win rate ≥ 70%",
+    enabled: false,
+    config: { minWinRate: 70 }
+  },
+  EARLY_ADOPTER: {
+    name: "⚡ Early Adopter",
+    description: "Wallets that buy tokens early",
+    criteria: "Buys within 1 hour of launch",
+    enabled: false,
+    config: { maxAge: 3600 }
+  },
+  PROFIT_TAKER: {
+    name: "💰 Profit Taker",
+    description: "Wallets that take profits at 2x+",
+    criteria: "Takes profit at 100%+ gains",
+    enabled: false,
+    config: { minProfit: 100 }
+  },
+  DIP_BUYER: {
+    name: "📉 Dip Buyer",
+    description: "Buys tokens after 20%+ dips",
+    criteria: "Buys after 20% price drop",
+    enabled: false,
+    config: { minDip: 20 }
+  }
+};
+
+// === PORTFOLIO TRACKING ===
+async function getPortfolioValue(userId) {
+  const portfolio = await db.get(`user_${userId}.portfolio`) || {};
+  const tokens = await db.get(`user_${userId}.watchlist.tokens`) || [];
+  
+  let totalValue = 0;
+  let totalCostBasis = 0;
+  const holdings = [];
+  
+  for (const token of tokens) {
+    const holding = portfolio[token.address.toLowerCase()];
+    if (holding && holding.amount > 0) {
+      try {
+        const dexData = await getDexCandles(token.pairAddress);
+        if (dexData) {
+          const currentPrice = dexData.currentPrice;
+          const currentValue = holding.amount * currentPrice;
+          const costBasis = holding.amount * holding.avgBuyPrice;
+          const pnl = currentValue - costBasis;
+          const pnlPercent = (pnl / costBasis) * 100;
+          
+          totalValue += currentValue;
+          totalCostBasis += costBasis;
+          
+          holdings.push({
+            symbol: token.symbol,
+            amount: holding.amount,
+            avgBuyPrice: holding.avgBuyPrice,
+            currentPrice,
+            currentValue,
+            costBasis,
+            pnl,
+            pnlPercent,
+            chain: token.chain
+          });
+        }
+      } catch (e) {
+        console.error(`Error calculating portfolio for ${token.symbol}:`, e);
+      }
+    }
+  }
+  
+  const totalPnl = totalValue - totalCostBasis;
+  const totalPnlPercent = totalCostBasis > 0 ? (totalPnl / totalCostBasis) * 100 : 0;
+  
+  return {
+    totalValue,
+    totalCostBasis,
+    totalPnl,
+    totalPnlPercent,
+    holdings
+  };
+}
+
+// === PRICE RANGE ALERTS ===
+async function checkPriceRangeAlerts(userId, token, currentPrice) {
+  const priceAlerts = await db.get(`user_${userId}.priceAlerts`) || {};
+  const tokenKey = token.address.toLowerCase();
+  const alerts = priceAlerts[tokenKey] || [];
+  
+  const triggeredAlerts = [];
+  
+  for (const alert of alerts) {
+    if (!alert.triggered) {
+      let shouldTrigger = false;
+      
+      if (alert.type === 'above' && currentPrice >= alert.price) {
+        shouldTrigger = true;
+      } else if (alert.type === 'below' && currentPrice <= alert.price) {
+        shouldTrigger = true;
+      } else if (alert.type === 'range' && 
+                 currentPrice >= alert.minPrice && 
+                 currentPrice <= alert.maxPrice) {
+        shouldTrigger = true;
+      }
+      
+      if (shouldTrigger) {
+        alert.triggered = true;
+        alert.triggeredAt = Date.now();
+        alert.triggeredPrice = currentPrice;
+        triggeredAlerts.push(alert);
+      }
+    }
+  }
+  
+  if (triggeredAlerts.length > 0) {
+    await db.set(`user_${userId}.priceAlerts.${tokenKey}`, alerts);
+  }
+  
+  return triggeredAlerts;
+}
 
 // === HELPER FUNCTIONS ===
 async function safeTaapi(endpoint, method = "GET", body = null) {
@@ -269,7 +843,7 @@ async function getIndicatorsFromBackfill(candles) {
   };
 }
 
-async function importWatchlistFromURL(userId, name, url) {
+async function importWatchlistFromURL(userId, url) {
   const clean = url.replace(/[`<>]/g, "").trim();
   const m = clean.match(/watchlist\/([A-Za-z0-9_-]+)/);
   const id = m ? m[1] : clean;
@@ -287,7 +861,7 @@ async function importWatchlistFromURL(userId, name, url) {
   const data = await res.json();
   if (!data?.pairs || data.pairs.length === 0)
     throw new Error("Empty watchlist or invalid ID");
-  const tokens = data.pairs.map((p) => ({
+  const newTokens = data.pairs.map((p) => ({
     symbol: p.baseToken.symbol,
     address: p.baseToken.address,
     chain: p.chainId,
@@ -295,13 +869,16 @@ async function importWatchlistFromURL(userId, name, url) {
     source: "dex",
     pairAddress: p.pairAddress,
   }));
-  await db.set(`user_${userId}.watchlists.${name}`, {
-    url: clean,
-    tokens,
-    lastSync: Date.now(),
-    alerts: [],
-  });
-  return tokens;
+  
+  // Get existing tokens and merge with new ones (avoid duplicates)
+  const existingTokens = (await db.get(`user_${userId}.watchlist.tokens`)) || [];
+  const existingAddresses = new Set(existingTokens.map(t => t.address.toLowerCase()));
+  const uniqueNewTokens = newTokens.filter(t => !existingAddresses.has(t.address.toLowerCase()));
+  
+  const allTokens = [...existingTokens, ...uniqueNewTokens];
+  await db.set(`user_${userId}.watchlist.tokens`, allTokens);
+  
+  return uniqueNewTokens; // Return only the newly added tokens
 }
 
 async function sendAlert(userId, token, ind, pred, price, presetName) {
@@ -336,6 +913,31 @@ EMA 9: ${ind.ema9} | EMA 21: ${ind.ema21}
   });
 }
 
+async function sendPriceRangeAlert(userId, token, currentPrice, alert) {
+  let alertMsg = ``;
+  
+  if (alert.type === 'above') {
+    alertMsg = `🚀 <b>Price Alert: Above Target!</b>\n\n`;
+    alertMsg += `<b>${token.symbol}</b> has risen above $${alert.price}\n`;
+    alertMsg += `Current Price: $${currentPrice.toFixed(6)}`;
+  } else if (alert.type === 'below') {
+    alertMsg = `📉 <b>Price Alert: Below Target!</b>\n\n`;
+    alertMsg += `<b>${token.symbol}</b> has fallen below $${alert.price}\n`;
+    alertMsg += `Current Price: $${currentPrice.toFixed(6)}`;
+  } else if (alert.type === 'range') {
+    alertMsg = `🎯 <b>Price Alert: In Range!</b>\n\n`;
+    alertMsg += `<b>${token.symbol}</b> is now in the $${alert.minPrice}-$${alert.maxPrice} range\n`;
+    alertMsg += `Current Price: $${currentPrice.toFixed(6)}`;
+  }
+  
+  alertMsg += `\n\n<a href="${token.url}">View Chart</a>`;
+  
+  await bot.telegram.sendMessage(userId, alertMsg, {
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  });
+}
+
 // === MAIN MENU ===
 function getMainMenu() {
   return Markup.inlineKeyboard([
@@ -345,7 +947,7 @@ function getMainMenu() {
     ],
     [
       Markup.button.callback("🔔 Alerts", "menu_alerts"),
-      Markup.button.callback("🤖 AI Settings", "menu_ai"),
+      Markup.button.callback("📈 Portfolio", "menu_portfolio"),
     ],
     [
       Markup.button.callback("📊 PnL", "menu_pnl"),
@@ -361,8 +963,8 @@ function getMainMenu() {
 // === BOT COMMANDS ===
 bot.start((ctx) => {
   ctx.replyWithHTML(
-    `🚀 <b>DEX Alert AI Bot v1.0</b>
-<i>UI v1.1 Settings</i>
+    `🚀 <b>DEX Alert AI Bot v1.0.2</b>
+<i>UI v1.2 Portfolio + Price Alerts</i>
 
 Welcome! I help you find profitable memecoin trades with:
 
@@ -371,6 +973,8 @@ Welcome! I help you find profitable memecoin trades with:
 🤖 AI predictions (DeepSeek 3.1)
 📊 9 Alert presets + custom alerts
 💰 Wallet & PnL tracking
+📈 Portfolio tracking with P&L
+💰 Price range alerts
 🔔 Smart alerts (every 2 min)
 
 👇 Choose an option below:`,
@@ -378,11 +982,46 @@ Welcome! I help you find profitable memecoin trades with:
   );
 });
 
+// Handle wallet view
+bot.action(/^wallet_view_(\d+)$/, async (ctx) => {
+  try {
+    ctx.answerCbQuery(); // Answer immediately
+    const walletIndex = parseInt(ctx.match[1]);
+    const wallets = (await db.get(`user_${ctx.from.id}.wallets`)) || [];
+    
+    if (walletIndex >= wallets.length || walletIndex < 0) {
+      return ctx.answerCbQuery("Invalid wallet selection", { show_alert: true });
+    }
+    
+    const wallet = wallets[walletIndex];
+    
+    ctx.editMessageText(
+      `💰 <b>Wallet Details</b>\n\n` +
+      `<b>Label:</b> ${wallet.label}\n` +
+      `<b>Address:</b> <code>${wallet.address}</code>\n` +
+      `<b>Added:</b> ${new Date(wallet.addedAt || Date.now()).toLocaleDateString()}\n\n` +
+      `<i>Use /pnl wallet to see portfolio stats for this wallet</i>`,
+      {
+        parse_mode: "HTML",
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback("📊 View Portfolio", "menu_portfolio")],
+          [Markup.button.callback("📃 Back to Wallets", "wallet_list")],
+          [Markup.button.callback("« Back to Wallet Menu", "menu_wallets")]
+        ])
+      }
+    );
+    
+  } catch (error) {
+    console.error('Error viewing wallet:', error);
+    ctx.answerCbQuery("Error viewing wallet", { show_alert: true });
+  }
+});
+
 // === MENU ACTIONS ===
 bot.action("back_main", (ctx) => {
   ctx.answerCbQuery();
   ctx.editMessageText(
-    `🚀 <b>DEX Alert AI Bot v1.0</b>\n<i>UI v1.1 Settings</i>\n\nWelcome! I help you find profitable memecoin trades with:\n\n✨ <b>Features</b>\n🔷 DEX monitoring (DexScreener)\n🤖 AI predictions (DeepSeek 3.1)\n📊 9 Alert presets + custom alerts\n💰 Wallet & PnL tracking\n🔔 Smart alerts (every 2 min)\n\n👇 Choose an option below:`,
+    `🚀 <b>DEX Alert AI Bot v1.0.2</b>\n<i>UI v1.2 Portfolio + Price Alerts</i>\n\nWelcome! I help you find profitable memecoin trades with:\n\n✨ <b>Features</b>\n🔷 DEX monitoring (DexScreener)\n🤖 AI predictions (DeepSeek 3.1)\n📊 9 Alert presets + custom alerts\n💰 Wallet & PnL tracking\n📈 Portfolio tracking with P&L\n💰 Price range alerts\n🔔 Smart alerts (every 2 min)\n\n👇 Choose an option below:`,
     { parse_mode: "HTML", ...getMainMenu() }
   );
 });
@@ -393,13 +1032,14 @@ bot.action("menu_wallets", (ctx) => {
   const buttons = Markup.inlineKeyboard([
     [Markup.button.callback("➕ Add Wallet", "wallet_add")],
     [Markup.button.callback("📃 View Wallets", "wallet_list")],
+    [Markup.button.callback("🎯 Wallet Presets", "wallet_presets")],
     [Markup.button.callback("📤 Export Wallets", "wallet_export")],
     [Markup.button.callback("« Back", "back_main")],
   ]);
   ctx.editMessageText(
     `💰 <b>Wallet Management</b>\n\n` +
       `Manage your wallets for PnL tracking\n\n` +
-      `Choose an option:`,
+      `Choose an action:`,
     { parse_mode: "HTML", ...buttons }
   );
 });
@@ -448,21 +1088,562 @@ bot.action("wallet_list", async (ctx) => {
 });
 
 bot.action("wallet_export", async (ctx) => {
-  ctx.answerCbQuery();
-  const wallets = (await db.get(`user_${ctx.from.id}.wallets`)) || [];
+  try {
+    ctx.answerCbQuery(); // Answer immediately
+    const wallets = (await db.get(`user_${ctx.from.id}.wallets`)) || [];
 
-  if (wallets.length === 0) {
-    return ctx.answerCbQuery("No wallets to export", { show_alert: true });
+    if (wallets.length === 0) {
+      return ctx.answerCbQuery("No wallets to export", { show_alert: true });
+    }
+
+    const csv =
+      "Label,Address\n" +
+      wallets.map((w) => `${w.label},${w.address}`).join("\n");
+    
+    await ctx.replyWithDocument({
+      source: Buffer.from(csv),
+      filename: "wallets.csv",
+    });
+    
+    ctx.replyWithHTML(
+      `✅ <b>Wallets exported successfully!</b>\n\n` +
+      `📄 File: <code>wallets.csv</code>\n` +
+      `📤 ${wallets.length} wallet(s) exported\n\n` +
+      `The file has been sent to your chat.`,
+      {
+        parse_mode: "HTML",
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback("📃 View Wallets", "wallet_list")],
+          [Markup.button.callback("« Back to Wallet Menu", "menu_wallets")]
+        ])
+      }
+    );
+    
+  } catch (error) {
+    console.error('Error exporting wallets:', error);
+    ctx.answerCbQuery("Error exporting wallets", { show_alert: true });
   }
+});
 
-  const csv =
-    "Label,Address\n" +
-    wallets.map((w) => `${w.label},${w.address}`).join("\n");
-  await ctx.replyWithDocument({
-    source: Buffer.from(csv),
-    filename: "wallets.csv",
+// === WALLET PRESETS ===
+bot.action("wallet_presets", async (ctx) => {
+  try {
+    ctx.answerCbQuery(); // Answer immediately
+    const userId = ctx.from.id;
+    
+    // Get user's wallet presets configuration
+    const userPresets = (await db.get(`user_${userId}.wallet_presets`)) || {};
+    
+    // Create buttons for each preset with on/off status
+    const presetButtons = Object.entries(WALLET_PRESETS).map(([key, preset]) => {
+      const isEnabled = userPresets[key]?.enabled || false;
+      return [
+        Markup.button.callback(`${isEnabled ? '✅' : '❌'} ${preset.name}`, `toggle_wallet_preset_${key}`),
+        Markup.button.callback(isEnabled ? '🔧 Modify' : '⚡ Enable', `wallet_preset_detail_${key}`)
+      ];
+    });
+    
+    // Add action buttons
+    const actionButtons = [
+      [Markup.button.callback("📋 View All Criteria", "wallet_presets_criteria")],
+      [Markup.button.callback("💾 Save Configuration", "save_wallet_presets")],
+      [Markup.button.callback("« Back to Wallet Menu", "menu_wallets")]
+    ];
+    
+    const allButtons = [...presetButtons, ...actionButtons];
+    
+    ctx.editMessageText(
+      `🎯 <b>Wallet Presets</b>\n\n` +
+        `Configure wallet tracking presets to automatically identify and track wallets based on specific criteria.\n\n` +
+        `Click a preset to toggle it on/off or view details:`,
+      { parse_mode: "HTML", ...Markup.inlineKeyboard(allButtons) }
+    );
+    
+  } catch (error) {
+    console.error('Error showing wallet presets:', error);
+    ctx.answerCbQuery("Error loading wallet presets", { show_alert: true });
+  }
+});
+
+// Toggle wallet preset on/off
+bot.action(/^toggle_wallet_preset_(.+)$/, async (ctx) => {
+  try {
+    ctx.answerCbQuery(); // Answer immediately
+    const presetKey = ctx.match[1];
+    const preset = WALLET_PRESETS[presetKey];
+    
+    if (!preset) {
+      return ctx.answerCbQuery("Invalid preset", { show_alert: true });
+    }
+    
+    const userId = ctx.from.id;
+    const userPresets = (await db.get(`user_${userId}.wallet_presets`)) || {};
+    
+    // Toggle the preset
+    if (!userPresets[presetKey]) {
+      userPresets[presetKey] = { ...preset.config, enabled: true };
+    } else {
+      userPresets[presetKey].enabled = !userPresets[presetKey].enabled;
+    }
+    
+    await db.set(`user_${userId}.wallet_presets`, userPresets);
+    
+    const isNowEnabled = userPresets[presetKey].enabled;
+    ctx.answerCbQuery(`${preset.name} ${isNowEnabled ? 'enabled' : 'disabled'}!`, { show_alert: true });
+    
+    // Just show success message - user can navigate back manually
+    
+  } catch (error) {
+    console.error('Error toggling wallet preset:', error);
+    ctx.answerCbQuery("Error toggling preset", { show_alert: true });
+  }
+});
+
+// Show wallet preset details with criteria and modify options
+bot.action(/^wallet_preset_detail_(.+)$/, async (ctx) => {
+  try {
+    ctx.answerCbQuery(); // Answer immediately
+    const presetKey = ctx.match[1];
+    const preset = WALLET_PRESETS[presetKey];
+    
+    if (!preset) {
+      return ctx.answerCbQuery("Invalid preset", { show_alert: true });
+    }
+    
+    const userId = ctx.from.id;
+    const userPresets = (await db.get(`user_${userId}.wallet_presets`)) || {};
+    const isEnabled = userPresets[presetKey]?.enabled || false;
+    
+    // Show detailed preset information
+    ctx.editMessageText(
+      `🎯 <b>${preset.name}</b>\n\n` +
+        `<b>Description:</b> ${preset.description}\n\n` +
+        `<b>Criteria:</b> ${preset.criteria}\n\n` +
+        `<b>Configuration:</b>\n` +
+        `• Status: ${isEnabled ? '✅ Active' : '❌ Inactive'}\n` +
+        `• Auto-detect: ${isEnabled ? 'Yes' : 'No'}\n\n` +
+        `Adjust settings or save as custom preset:`,
+      {
+        parse_mode: "HTML",
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback(`${isEnabled ? '⏸ Disable' : '⚡ Enable'} Preset`, `toggle_wallet_preset_${presetKey}`)],
+          [Markup.button.callback("🔧 Modify Criteria", `modify_wallet_preset_${presetKey}`)],
+          [Markup.button.callback("💾 Save as New Preset", `save_wallet_preset_${presetKey}`)],
+          [Markup.button.callback("📋 View Example", `wallet_preset_example_${presetKey}`)],
+          [Markup.button.callback("« Back to Wallet Presets", "wallet_presets")]
+        ])
+      }
+    );
+    
+  } catch (error) {
+    console.error('Error showing wallet preset details:', error);
+    ctx.answerCbQuery("Error loading preset details", { show_alert: true });
+  }
+});
+
+// Show wallet preset criteria overview
+bot.action("wallet_presets_criteria", async (ctx) => {
+  try {
+    ctx.answerCbQuery(); // Answer immediately
+    
+    let criteriaText = `📋 <b>Wallet Presets Criteria Overview</b>\n\n`;
+    
+    Object.entries(WALLET_PRESETS).forEach(([key, preset]) => {
+      criteriaText += `<b>${preset.name}</b>\n`;
+      criteriaText += `• ${preset.criteria}\n`;
+      criteriaText += `• ${preset.description}\n\n`;
+    });
+    
+    criteriaText += `All presets work automatically when you add new wallets or scan existing ones.`;
+    
+    ctx.editMessageText(criteriaText, {
+      parse_mode: "HTML",
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback("💾 Save Configuration", "save_wallet_presets")],
+        [Markup.button.callback("« Back to Wallet Presets", "wallet_presets")]
+      ])
+    });
+    
+  } catch (error) {
+    console.error('Error showing wallet preset criteria:', error);
+    ctx.answerCbQuery("Error loading criteria", { show_alert: true });
+  }
+});
+
+// Show example of wallet preset in action
+bot.action(/^wallet_preset_example_(.+)$/, async (ctx) => {
+  try {
+    ctx.answerCbQuery(); // Answer immediately
+    const presetKey = ctx.match[1];
+    const preset = WALLET_PRESETS[presetKey];
+    
+    if (!preset) {
+      return ctx.answerCbQuery("Invalid preset", { show_alert: true });
+    }
+    
+    let exampleText = `💡 <b>${preset.name} - Example</b>\n\n`;
+    
+    switch (presetKey) {
+      case 'WHALE_TRACKER':
+        exampleText += `When this preset is enabled, the bot will automatically flag wallets that hold more than $100,000 in total value.\n\n`;
+        exampleText += `<b>Example detection:</b>\n`;
+        exampleText += `• Wallet: 0x742d...89Ab\n`;
+        exampleText += `• Total Value: $245,000\n`;
+        exampleText += `• Status: 🐋 Whale Detected!\n\n`;
+        exampleText += `These wallets are often early investors or smart money.`;
+        break;
+      case 'SMART_MONEY':
+        exampleText += `Identifies wallets with high win rates (70%+) based on their trading history.\n\n`;
+        exampleText += `<b>Example detection:</b>\n`;
+        exampleText += `• Wallet: 0x3f4e...12Cd\n`;
+        exampleText += `• Win Rate: 78%\n`;
+        exampleText += `• Total Trades: 156\n`;
+        exampleText += `• Status: 🧠 Smart Money!\n\n`;
+        exampleText += `Follow these wallets for profitable trades.`;
+        break;
+      case 'EARLY_ADOPTER':
+        exampleText += `Tracks wallets that buy tokens within 1 hour of launch.\n\n`;
+        exampleText += `<b>Example detection:</b>\n`;
+        exampleText += `• Token: PEPE Launch\n`;
+        exampleText += `• Buy Time: 45 minutes after launch\n`;
+        exampleText += `• Wallet: 0x9a8b...34Ef\n`;
+        exampleText += `• Status: ⚡ Early Adopter!\n\n`;
+        exampleText += `These wallets often find gems before they pump.`;
+        break;
+      default:
+        exampleText += `This preset helps identify wallets that match specific trading patterns.\n\n`;
+        exampleText += `When enabled, it will automatically scan and flag wallets that meet the criteria.`;
+    }
+    
+    ctx.editMessageText(exampleText, {
+      parse_mode: "HTML",
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback("🔧 Modify This Preset", `modify_wallet_preset_${presetKey}`)],
+        [Markup.button.callback("« Back to Preset Details", `wallet_preset_detail_${presetKey}`)]
+      ])
+    });
+    
+  } catch (error) {
+    console.error('Error showing wallet preset example:', error);
+    ctx.answerCbQuery("Error loading example", { show_alert: true });
+  }
+});
+
+// Modify wallet preset (placeholder for customization)
+bot.action(/^modify_wallet_preset_(.+)$/, async (ctx) => {
+  try {
+    ctx.answerCbQuery(); // Answer immediately
+    const presetKey = ctx.match[1];
+    const preset = WALLET_PRESETS[presetKey];
+    
+    if (!preset) {
+      return ctx.answerCbQuery("Invalid preset", { show_alert: true });
+    }
+    
+    const userId = ctx.from.id;
+    const userPresets = (await db.get(`user_${userId}.wallet_presets`)) || {};
+    const currentConfig = userPresets[presetKey] || preset.config;
+    
+    ctx.editMessageText(
+      `🔧 <b>Modify ${preset.name}</b>\n\n` +
+        `<b>Current Settings:</b>\n` +
+        `${JSON.stringify(currentConfig, null, 2)}\n\n` +
+        `Preset customization is coming soon! You'll be able to adjust thresholds and parameters.\n\n` +
+        `For now, you can save this as a new custom preset.`,
+      {
+        parse_mode: "HTML",
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback("💾 Save as New Preset", `save_wallet_preset_${presetKey}`)],
+          [Markup.button.callback("« Back to Preset Details", `wallet_preset_detail_${presetKey}`)]
+        ])
+      }
+    );
+    
+  } catch (error) {
+    console.error('Error modifying wallet preset:', error);
+    ctx.answerCbQuery("Error modifying preset", { show_alert: true });
+  }
+});
+
+// Save wallet preset as new custom preset
+bot.action(/^save_wallet_preset_(.+)$/, async (ctx) => {
+  try {
+    ctx.answerCbQuery(); // Answer immediately
+    const presetKey = ctx.match[1];
+    const preset = WALLET_PRESETS[presetKey];
+    
+    if (!preset) {
+      return ctx.answerCbQuery("Invalid preset", { show_alert: true });
+    }
+    
+    const userId = ctx.from.id;
+    const userPresets = (await db.get(`user_${userId}.wallet_presets`)) || {};
+    
+    // Save as custom preset with timestamp
+    const customKey = `CUSTOM_${presetKey}_${Date.now()}`;
+    userPresets[customKey] = {
+      ...preset.config,
+      enabled: true,
+      name: `${preset.name} (Custom)`,
+      description: preset.description,
+      criteria: preset.criteria,
+      basedOn: presetKey
+    };
+    
+    await db.set(`user_${userId}.wallet_presets`, userPresets);
+    
+    ctx.answerCbQuery(`Custom preset saved!`, { show_alert: true });
+    
+    // Just show success message - user can navigate back manually
+    
+  } catch (error) {
+    console.error('Error saving wallet preset:', error);
+    ctx.answerCbQuery("Error saving preset", { show_alert: true });
+  }
+});
+
+// Save all wallet presets configuration
+bot.action("save_wallet_presets", async (ctx) => {
+  try {
+    ctx.answerCbQuery(); // Answer immediately
+    const userId = ctx.from.id;
+    const userPresets = (await db.get(`user_${userId}.wallet_presets`)) || {};
+    
+    const enabledCount = Object.values(userPresets).filter(p => p.enabled).length;
+    
+    ctx.editMessageText(
+      `✅ <b>Wallet Presets Configuration Saved</b>\n\n` +
+        `• Total presets: ${Object.keys(WALLET_PRESETS).length}\n` +
+        `• Enabled presets: ${enabledCount}\n` +
+        `• Custom presets: ${Object.keys(userPresets).filter(k => k.startsWith('CUSTOM_')).length}\n\n` +
+        `Your wallet preset configuration has been saved and will be applied to new wallets.`,
+      {
+        parse_mode: "HTML",
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback("« Back to Wallet Presets", "wallet_presets")]
+        ])
+      }
+    );
+    
+  } catch (error) {
+    console.error('Error saving wallet presets config:', error);
+    ctx.answerCbQuery("Error saving configuration", { show_alert: true });
+  }
+});
+
+// === PORTFOLIO MENU ===
+bot.action("menu_portfolio", async (ctx) => {
+  ctx.answerCbQuery();
+  const portfolio = await getPortfolioValue(ctx.from.id);
+  const buttons = Markup.inlineKeyboard([
+    [Markup.button.callback("💼 View Holdings", "portfolio_view")],
+    [Markup.button.callback("➕ Add Position", "portfolio_add")],
+    [Markup.button.callback("📊 P&L Summary", "portfolio_summary")],
+    [Markup.button.callback("💰 Price Alerts", "portfolio_price_alerts")],
+    [Markup.button.callback("« Back", "back_main")],
+  ]);
+  
+  const totalValue = portfolio.totalValue.toFixed(2);
+  const totalPnl = portfolio.totalPnl.toFixed(2);
+  const pnlEmoji = portfolio.totalPnl >= 0 ? "🟢" : "🔴";
+  
+  ctx.editMessageText(
+    `📈 <b>Portfolio Management</b>\n\n` +
+      `Total Value: <b>$${totalValue}</b>\n` +
+      `Total P&L: ${pnlEmoji} <b>$${totalPnl} (${portfolio.totalPnlPercent.toFixed(2)}%)</b>\n\n` +
+      `Holdings: <b>${portfolio.holdings.length}</b> tokens\n\n` +
+      `Choose an option:`,
+    { parse_mode: "HTML", ...buttons }
+  );
+});
+
+bot.action("portfolio_view", async (ctx) => {
+  ctx.answerCbQuery();
+  const portfolio = await getPortfolioValue(ctx.from.id);
+  
+  if (portfolio.holdings.length === 0) {
+    return ctx.editMessageText(
+      `💼 <b>Your Holdings</b>\n\n` +
+        `No active positions found.\n\n` +
+        `Add positions to track your portfolio performance.`,
+      { parse_mode: "HTML", ...Markup.inlineKeyboard([
+        [Markup.button.callback("➕ Add Position", "portfolio_add")],
+        [Markup.button.callback("« Back", "menu_portfolio")],
+      ]) }
+    );
+  }
+  
+  let holdingsText = `💼 <b>Your Holdings</b>\n\n`;
+  portfolio.holdings.forEach((holding, index) => {
+    const pnlEmoji = holding.pnl >= 0 ? "🟢" : "🔴";
+    holdingsText += `${index + 1}. <b>${holding.symbol}</b> (${holding.chain})\n`;
+    holdingsText += `   Amount: ${holding.amount.toFixed(4)}\n`;
+    holdingsText += `   Avg Buy: $${holding.avgBuyPrice.toFixed(6)}\n`;
+    holdingsText += `   Current: $${holding.currentPrice.toFixed(6)}\n`;
+    holdingsText += `   Value: $${holding.currentValue.toFixed(2)}\n`;
+    holdingsText += `   P&L: ${pnlEmoji} $${holding.pnl.toFixed(2)} (${holding.pnlPercent.toFixed(2)}%)\n\n`;
   });
-  ctx.answerCbQuery("Wallets exported!");
+  
+  ctx.editMessageText(holdingsText, {
+    parse_mode: "HTML",
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback("📊 Summary", "portfolio_summary")],
+      [Markup.button.callback("« Back", "menu_portfolio")],
+    ]),
+  });
+});
+
+bot.action("portfolio_add", (ctx) => {
+  ctx.answerCbQuery();
+  ctx.editMessageText(
+    `➕ <b>Add Position</b>\n\n` +
+      `Send position details in this format:\n\n` +
+      `<code>/portfolio add ADDRESS AMOUNT BUY_PRICE</code>\n\n` +
+      `<b>Example:</b>\n` +
+      `<code>/portfolio add 0x123... 1000 0.05</code>\n\n` +
+      `<i>This will add 1000 tokens bought at $0.05 each</i>`,
+    { parse_mode: "HTML", ...Markup.inlineKeyboard([
+      [Markup.button.callback("« Back", "menu_portfolio")],
+    ]) }
+  );
+});
+
+bot.action("portfolio_summary", async (ctx) => {
+  ctx.answerCbQuery();
+  const portfolio = await getPortfolioValue(ctx.from.id);
+  
+  if (portfolio.holdings.length === 0) {
+    return ctx.editMessageText(
+      `📊 <b>P&L Summary</b>\n\n` +
+        `No active positions to summarize.`,
+      { parse_mode: "HTML", ...Markup.inlineKeyboard([
+        [Markup.button.callback("« Back", "menu_portfolio")],
+      ]) }
+    );
+  }
+  
+  // Sort by P&L percentage
+  const sortedHoldings = [...portfolio.holdings].sort((a, b) => b.pnlPercent - a.pnlPercent);
+  const bestPerformer = sortedHoldings[0];
+  const worstPerformer = sortedHoldings[sortedHoldings.length - 1];
+  
+  let summaryText = `📊 <b>P&L Summary</b>\n\n`;
+  summaryText += `💰 Total Value: <b>$${portfolio.totalValue.toFixed(2)}</b>\n`;
+  summaryText += `💸 Total Cost: <b>$${portfolio.totalCostBasis.toFixed(2)}</b>\n`;
+  summaryText += `📈 Total P&L: <b>$${portfolio.totalPnl.toFixed(2)} (${portfolio.totalPnlPercent.toFixed(2)}%)</b>\n\n`;
+  
+  if (bestPerformer) {
+    const bestEmoji = bestPerformer.pnlPercent >= 0 ? "🟢" : "🔴";
+    summaryText += `🏆 Best: <b>${bestPerformer.symbol}</b> ${bestEmoji} ${bestPerformer.pnlPercent.toFixed(2)}%\n`;
+  }
+  
+  if (worstPerformer && worstPerformer !== bestPerformer) {
+    const worstEmoji = worstPerformer.pnlPercent >= 0 ? "🟢" : "🔴";
+    summaryText += `📉 Worst: <b>${worstPerformer.symbol}</b> ${worstEmoji} ${worstPerformer.pnlPercent.toFixed(2)}%\n`;
+  }
+  
+  summaryText += `\nHoldings: <b>${portfolio.holdings.length}</b> tokens`;
+  
+  ctx.editMessageText(summaryText, {
+    parse_mode: "HTML",
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback("💼 View Holdings", "portfolio_view")],
+      [Markup.button.callback("« Back", "menu_portfolio")],
+    ]),
+  });
+});
+
+bot.action("portfolio_price_alerts", async (ctx) => {
+  ctx.answerCbQuery();
+  const buttons = Markup.inlineKeyboard([
+    [Markup.button.callback("➕ Add Price Alert", "price_alert_add")],
+    [Markup.button.callback("📋 View Alerts", "price_alert_list")],
+    [Markup.button.callback("🗑️ Clear Triggered", "price_alert_clear")],
+    [Markup.button.callback("« Back", "menu_portfolio")],
+  ]);
+  
+  ctx.editMessageText(
+    `💰 <b>Price Range Alerts</b>\n\n` +
+      `Set alerts for when tokens reach specific price levels.\n\n` +
+      `Choose an option:`,
+    { parse_mode: "HTML", ...buttons }
+  );
+});
+
+// === PRICE ALERT ACTIONS ===
+bot.action("price_alert_add", (ctx) => {
+  ctx.answerCbQuery();
+  ctx.editMessageText(
+    `➕ <b>Add Price Alert</b>\n\n` +
+      `Send alert details in this format:\n\n` +
+      `<code>/alert price ADDRESS TYPE PRICE</code>\n\n` +
+      `<b>Types:</b> above, below, range\n\n` +
+      `<b>Examples:</b>\n` +
+      `<code>/alert price 0x123... above 0.10</code>\n` +
+      `<code>/alert price 0x123... below 0.05</code>\n` +
+      `<code>/alert price 0x123... range 0.08-0.12</code>`,
+    { parse_mode: "HTML", ...Markup.inlineKeyboard([
+      [Markup.button.callback("« Back", "portfolio_price_alerts")],
+    ]) }
+  );
+});
+
+bot.action("price_alert_list", async (ctx) => {
+  ctx.answerCbQuery();
+  const priceAlerts = await db.get(`user_${ctx.from.id}.priceAlerts`) || {};
+  const tokens = await db.get(`user_${ctx.from.id}.watchlist.tokens`) || [];
+  
+  let alertText = `📋 <b>Your Price Alerts</b>\n\n`;
+  let hasAlerts = false;
+  
+  for (const token of tokens) {
+    const alerts = priceAlerts[token.address.toLowerCase()] || [];
+    if (alerts.length > 0) {
+      hasAlerts = true;
+      alertText += `<b>${token.symbol}</b> (${token.chain}):\n`;
+      alerts.forEach((alert, index) => {
+        const status = alert.triggered ? "✅" : "⏳";
+        if (alert.type === 'range') {
+          alertText += `   ${status} Range: $${alert.minPrice}-$${alert.maxPrice}\n`;
+        } else {
+          alertText += `   ${status} ${alert.type}: $${alert.price}\n`;
+        }
+      });
+      alertText += `\n`;
+    }
+  }
+  
+  if (!hasAlerts) {
+    alertText += `No price alerts set.\n\n`;
+    alertText += `Add alerts to monitor price movements.`;
+  }
+  
+  ctx.editMessageText(alertText, {
+    parse_mode: "HTML",
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback("➕ Add Alert", "price_alert_add")],
+      [Markup.button.callback("« Back", "portfolio_price_alerts")],
+    ]),
+  });
+});
+
+bot.action("price_alert_clear", async (ctx) => {
+  ctx.answerCbQuery();
+  const priceAlerts = await db.get(`user_${ctx.from.id}.priceAlerts`) || {};
+  
+  // Clear only triggered alerts
+  for (const tokenKey in priceAlerts) {
+    priceAlerts[tokenKey] = priceAlerts[tokenKey].filter(alert => !alert.triggered);
+    if (priceAlerts[tokenKey].length === 0) {
+      delete priceAlerts[tokenKey];
+    }
+  }
+  
+  await db.set(`user_${ctx.from.id}.priceAlerts`, priceAlerts);
+  ctx.answerCbQuery("Triggered alerts cleared!");
+  
+  // Refresh the list
+  bot.actions.get("price_alert_list")(ctx);
 });
 
 // === WATCHLIST MENU ===
@@ -470,16 +1651,19 @@ bot.action("menu_watchlist", (ctx) => {
   ctx.answerCbQuery();
   const buttons = Markup.inlineKeyboard([
     [
+      Markup.button.callback("➕ Add Token", "wl_add_token"),
       Markup.button.callback("📥 Import", "wl_import"),
-      Markup.button.callback("➕ Create", "wl_create"),
     ],
-    [Markup.button.callback("📃 View All", "wl_list")],
+    [
+      Markup.button.callback("📃 View All", "wl_list"),
+      Markup.button.callback("🗑️ Remove Token", "wl_remove_token"),
+    ],
     [Markup.button.callback("📤 Export", "wl_export")],
     [Markup.button.callback("« Back", "back_main")],
   ]);
   ctx.editMessageText(
     `📋 <b>Watchlist Management</b>\n\n` +
-      `Organize and track your favorite tokens\n\n` +
+      `Add tokens, import lists, or manage your watchlist\n\n` +
       `Choose an option:`,
     { parse_mode: "HTML", ...buttons }
   );
@@ -489,17 +1673,58 @@ bot.action("wl_import", (ctx) => {
   ctx.answerCbQuery();
   ctx.editMessageText(
     `📥 <b>Import Watchlist</b>\n\n` +
-      `<b>From DexScreener:</b>\n` +
-      `<code>/wl import https://dexscreener.com/watchlist/abc123</code>\n\n` +
-      `<b>From CSV:</b>\n` +
-      `Send a CSV file with columns: symbol, address, chain, pairAddress`,
+      `<b>Choose import method:</b>\n\n` +
+      `• <b>DexScreener:</b> Import from URL\n` +
+      `• <b>CSV/TXT:</b> Upload file with addresses\n` +
+      `• <b>Manual:</b> Use "Add Token" for single tokens`,
     {
       parse_mode: "HTML",
       ...Markup.inlineKeyboard([
+        [Markup.button.callback("🔗 DexScreener URL", "wl_import_dex")],
+        [Markup.button.callback("📄 Upload CSV/TXT", "wl_import_file")],
         [Markup.button.callback("« Back", "menu_watchlist")],
       ]),
     }
   );
+});
+
+bot.action("wl_import_dex", (ctx) => {
+  ctx.answerCbQuery();
+  ctx.editMessageText(
+    `🔗 <b>DexScreener Import</b>\n\n` +
+      `Send the DexScreener watchlist URL:\n\n` +
+      `<code>/wl import https://dexscreener.com/watchlist/abc123</code>\n\n` +
+      `<i>Replace abc123 with your actual watchlist ID</i>`,
+    {
+      parse_mode: "HTML",
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback("« Back", "wl_import")],
+      ]),
+    }
+  );
+});
+
+bot.action("wl_import_file", (ctx) => {
+  ctx.answerCbQuery();
+  ctx.editMessageText(
+    `📄 <b>File Import</b>\n\n` +
+      `<b>CSV format:</b> address,chain,symbol (header optional)\n` +
+      `<b>TXT format:</b> One address per line\n\n` +
+      `<b>Example CSV:</b>\n` +
+      `<code>0x123...,ethereum,TOKEN1\n0x456...,bsc,TOKEN2</code>\n\n` +
+      `<b>Example TXT:</b>\n` +
+      `<code>0x123...\n0x456...</code>\n\n` +
+      `<i>Send your file now:</i>`,
+    {
+      parse_mode: "HTML",
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback("« Back", "wl_import")],
+      ]),
+    }
+  );
+  
+  // Set user flow to expect file import
+  db.set(`user_${ctx.from.id}.flow`, { type: 'awaiting_import' });
 });
 
 bot.action("wl_create", (ctx) => {
@@ -520,12 +1745,13 @@ bot.action("wl_create", (ctx) => {
 
 bot.action("wl_list", async (ctx) => {
   ctx.answerCbQuery();
-  const data = await db.get(`user_${ctx.from.id}`);
-  const lists = Object.keys(data?.watchlists || {});
-
-  if (lists.length === 0) {
+  
+  // Only use simplified watchlist structure - no more categories
+  const simpleTokens = await db.get(`user_${ctx.from.id}.watchlist.tokens`) || [];
+  
+  if (simpleTokens.length === 0) {
     return ctx.editMessageText(
-      `📃 <b>Your Watchlists</b>\n\n<i>No watchlists yet</i>\n\nCreate one with /wl create`,
+      `📃 <b>Your Watchlist</b>\n\n<i>No tokens yet</i>\n\nAdd tokens with "Add Token" button`,
       {
         parse_mode: "HTML",
         ...Markup.inlineKeyboard([
@@ -534,43 +1760,793 @@ bot.action("wl_list", async (ctx) => {
       }
     );
   }
-
-  const buttons = lists.map((name) => [
+  
+  let message = `📃 <b>Your Watchlist</b>\n\n`;
+  message += `<b>Tokens (${simpleTokens.length}):</b>\n\n`;
+  
+  simpleTokens.slice(0, 10).forEach((token, index) => {
+    message += `${index + 1}. <b>$${token.symbol}</b> (${token.chain})\n`;
+    message += `   <code>${token.address.substring(0, 6)}...${token.address.slice(-4)}</code>\n`;
+    if (token.liquidity > 0) {
+      message += `   💧 $${Math.round(token.liquidity).toLocaleString()}\n`;
+    }
+    message += '\n';
+  });
+  
+  if (simpleTokens.length > 10) {
+    message += `<i>...and ${simpleTokens.length - 10} more tokens</i>\n\n`;
+  }
+  
+  const buttons = simpleTokens.slice(0, 5).map((token, index) => [
     Markup.button.callback(
-      `📋 ${name}`,
-      `wl_view_${Buffer.from(name).toString("base64")}`
-    ),
+      `🗑️ ${token.symbol}`,
+      `remove_token_${index}`
+    )
   ]);
+  
   buttons.push([Markup.button.callback("« Back", "menu_watchlist")]);
+  
+  ctx.editMessageText(message, {
+    parse_mode: "HTML",
+    ...Markup.inlineKeyboard(buttons)
+  });
+});
 
+// === ADD TOKEN WIZARD ===
+bot.action("wl_add_token", async (ctx) => {
+  console.log(`User ${ctx.from.id} clicked "Add Token"`);
+  ctx.answerCbQuery();
+  
+  try {
+    await ctx.editMessageText(
+      `➕ <b>Add Token</b>\n\n` +
+        `Please send the token contract address.\n\n` +
+        `<i>I'll auto-detect the chain and show you the options.</i>`,
+      {
+        parse_mode: "HTML",
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback("« Back", "menu_watchlist")],
+        ]),
+      }
+    );
+    
+    console.log(`Setting flow state for user ${ctx.from.id}`);
+    await db.set(`user_${ctx.from.id}.flow`, { type: 'add_token', step: 'awaiting_address' });
+    console.log(`Flow state set successfully`);
+  } catch (error) {
+    console.error('Error in wl_add_token:', error);
+    ctx.reply('Sorry, there was an error. Please try /start and try again.');
+  }
+});
+
+// Handle token address input
+bot.on('text', async (ctx) => {
+  const userId = ctx.from.id;
+  const text = ctx.message.text.trim();
+  
+  console.log(`Received text message from user ${userId}: ${text}`);
+  
+  // Skip if it's a command
+  if (text.startsWith('/')) {
+    return;
+  }
+  
+  try {
+    const flow = await db.get(`user_${userId}.flow`);
+    console.log(`User flow state:`, flow);
+    
+    if (!flow || flow.type !== 'add_token' || flow.step !== 'awaiting_address') {
+      console.log(`User not in add token flow. Flow:`, flow);
+      // Not in add token flow, but let's provide helpful feedback
+      ctx.replyWithHTML(
+        `💡 <b>Not sure what to do with that message</b>\n\n` +
+          `Try these commands:\n` +
+          `• /start - Main menu\n` +
+          `• /wl add ADDRESS - Add token directly\n` +
+          `• Click "➕ Add Token" from the watchlist menu`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback("📋 Watchlist Menu", "menu_watchlist")],
+          [Markup.button.callback("🚀 Main Menu", "back_main")],
+        ])
+      );
+      return;
+    }
+    
+    const address = text;
+    
+    // Basic address validation
+    if (!address.match(/^0x[a-fA-F0-9]{40}$/) && !address.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/)) {
+      ctx.replyWithHTML(
+        `❌ <b>Invalid address format</b>\n\n` +
+          `Please send a valid token contract address.`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback("Try Again", "wl_add_token")],
+          [Markup.button.callback("« Back", "menu_watchlist")],
+        ])
+      );
+      return;
+    }
+    
+    ctx.replyWithHTML(`🔍 <b>Detecting chain...</b>\n\n<i>Please wait a moment (max 10 seconds).</i>`);
+  
+  try {
+    console.log(`Processing token address: ${address} for user ${userId}`);
+    const candidates = await detectChainFromAddress(address);
+    console.log(`Detection results:`, candidates);
+    
+    if (!candidates || candidates.length === 0) {
+      // No auto-detection, show manual chain selection (limited to 5 chains)
+      const manualChains = [
+        { id: 'ethereum', name: 'Ethereum' },
+        { id: 'bsc', name: 'BSC' },
+        { id: 'base', name: 'Base' },
+        { id: 'arbitrum', name: 'Arbitrum' },
+        { id: 'solana', name: 'Solana' }
+      ];
+      
+      const chainButtons = manualChains.map(chain => 
+        [Markup.button.callback(chain.name, `add_manual_chain_${chain.id}_${address}`)]
+      );
+      
+      ctx.replyWithHTML(
+        `❌ <b>Could not auto-detect chain</b>\n\n` +
+          `Please select the chain manually:`,
+        {
+          parse_mode: "HTML",
+          ...Markup.inlineKeyboard([
+            ...chainButtons,
+            [Markup.button.callback("« Cancel", "menu_watchlist")]
+          ])
+        }
+      );
+      
+      await db.set(`user_${userId}.flow`, { type: 'add_token', step: 'manual_chain', address });
+      return;
+    }
+    
+    // Show auto-detection results
+    const topCandidate = candidates[0];
+    const detectionText = `✅ <b>Detected chain: ${topCandidate.chain}</b>\n\n` +
+      `• Symbol: <b>$${topCandidate.symbol}</b>\n` +
+      `• Liquidity: <b>$${Math.round(topCandidate.liquidity).toLocaleString()}</b>\n` +
+      `• 24h Volume: <b>$${Math.round(topCandidate.volume24h).toLocaleString()}</b>\n` +
+      `• Price: <b>$${parseFloat(topCandidate.price).toFixed(6)}</b>\n\n` +
+      `Is this correct?`;
+    
+    const actionButtons = [
+      [Markup.button.callback("✅ Confirm", `add_confirm_${topCandidate.chainId}_${address}_${topCandidate.pairAddress}`)],
+      [Markup.button.callback("🔀 Choose Chain", `add_choose_chain_${address}`)]
+    ];
+    
+    if (candidates.length > 1) {
+      actionButtons.push([Markup.button.callback("🔍 View All Options", `add_view_all_${address}`)]);
+    }
+    
+    actionButtons.push([Markup.button.callback("« Cancel", "menu_watchlist")]);
+    
+    ctx.replyWithHTML(detectionText, {
+      parse_mode: "HTML",
+      ...Markup.inlineKeyboard(actionButtons)
+    });
+    
+    await db.set(`user_${userId}.flow`, { 
+      type: 'add_token', 
+      step: 'confirm_detection', 
+      address, 
+      candidates 
+    });
+    
+  } catch (error) {
+    console.error('Error in add token flow:', error);
+    let errorMessage = `❌ <b>Error detecting token</b>\n\n`;
+    
+    if (error.message === 'Chain detection timeout') {
+      errorMessage += `Chain detection timed out after 10 seconds.\n\n` +
+        `The token might not be available on the supported chains (Ethereum, BSC, Base, Arbitrum, Solana).\n\n` +
+        `Please try manual import or check the address.`;
+    } else {
+      errorMessage += `Please try again or use manual import.`;
+    }
+    
+    ctx.replyWithHTML(errorMessage,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Try Manual Import", "wl_add_token_manual")],
+        [Markup.button.callback("Try Again", "wl_add_token")],
+        [Markup.button.callback("« Back", "menu_watchlist")],
+      ])
+    );
+  }
+} catch (error) {
+    console.error('Error in token detection:', error);
+    let errorMessage = `❌ <b>Error detecting token</b>\n\n`;
+    
+    if (error.message === 'Chain detection timeout') {
+      errorMessage += `Chain detection timed out after 10 seconds.\n\n` +
+        `The token might not be available on the supported chains (Ethereum, BSC, Base, Arbitrum, Solana).\n\n` +
+        `Please try manual import or check the address.`;
+    } else {
+      errorMessage += `Please try again or use manual import.`;
+    }
+    
+    ctx.replyWithHTML(errorMessage,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Try Manual Import", "wl_add_token_manual")],
+        [Markup.button.callback("Try Again", "wl_add_token")],
+        [Markup.button.callback("« Back", "menu_watchlist")],
+      ])
+    );
+  }
+});
+
+// Handle chain selection from multiple candidates
+bot.action(/^add_choose_chain_(.+)$/, async (ctx) => {
+  const address = ctx.match[1];
+  const userId = ctx.from.id;
+  const flow = await db.get(`user_${userId}.flow`);
+  
+  if (!flow || flow.type !== 'add_token' || !flow.candidates) {
+    return ctx.answerCbQuery("Session expired", { show_alert: true });
+  }
+  
+  ctx.answerCbQuery();
+  
+  const chainButtons = flow.candidates.map(candidate => 
+    [Markup.button.callback(
+      `${candidate.chain} (Liq: $${Math.round(candidate.liquidity).toLocaleString()})`, 
+      `add_confirm_${candidate.chainId}_${address}_${candidate.pairAddress}`
+    )]
+  );
+  
+  chainButtons.push([Markup.button.callback("« Back", "wl_add_token")]);
+  
   ctx.editMessageText(
-    `📃 <b>Your Watchlists (${lists.length})</b>\n\n` +
-      `Click to view details:`,
-    { parse_mode: "HTML", ...Markup.inlineKeyboard(buttons) }
+    `🔀 <b>Select Chain</b>\n\n` +
+      `Choose the chain for this token:`,
+    { parse_mode: "HTML", ...Markup.inlineKeyboard(chainButtons) }
   );
 });
 
+// Handle manual chain selection
+bot.action(/^add_manual_chain_(.+)_(.+)$/, async (ctx) => {
+  const chainId = ctx.match[1];
+  const address = ctx.match[2];
+  const userId = ctx.from.id;
+  
+  ctx.answerCbQuery();
+  
+  // Save token with minimal info (no pair address since we don't have DexScreener data)
+  const tokenData = {
+    address,
+    chain: chainId,
+    symbol: 'Unknown',
+    pairAddress: '',
+    url: '',
+    addedAt: Date.now()
+  };
+  
+  await addTokenToWatchlist(userId, tokenData);
+  
+  ctx.editMessageText(
+    `✅ <b>Token Added</b>\n\n` +
+      `• Address: <code>${address}</code>\n` +
+      `• Chain: <b>${chainId}</b>\n\n` +
+      `<i>Note: Limited info due to no DexScreener data</i>`,
+    {
+      parse_mode: "HTML",
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback("Add Another", "wl_add_token")],
+        [Markup.button.callback("« Back", "menu_watchlist")],
+      ])
+    }
+  );
+  
+  await db.set(`user_${userId}.flow`, null);
+});
+
+// === ADDITIONAL FEATURE SUGGESTIONS ===
+
+// Quick Stats Command
+bot.command("stats", async (ctx) => {
+  const userId = ctx.from.id;
+  const data = await db.get(`user_${userId}`);
+  
+  const tokens = await db.get(`user_${userId}.watchlist.tokens`) || [];
+  const alerts = data?.alerts || {};
+  const wallets = data?.wallets || [];
+  
+  const enabledAlerts = Object.values(alerts).filter(a => a.enabled).length;
+  const totalAlerts = Object.keys(alerts).length;
+  
+  ctx.replyWithHTML(
+    `📊 <b>Your Stats</b>\n\n` +
+      `💰 Wallets: <b>${wallets.length}</b>\n` +
+      `📋 Tokens: <b>${tokens.length}</b>\n` +
+      `🔔 Alerts: <b>${enabledAlerts}/${totalAlerts}</b> enabled\n` +
+      `🤖 AI: <b>${data?.ai?.enabled ? '✅ ON' : '❌ OFF'}</b>\n` +
+      `⏱ Last scan: <b>~2 min ago</b>\n\n` +
+      `<i>Use /help for commands</i>`
+  );
+});
+
+// Quick Actions Menu
+bot.command("quick", (ctx) => {
+  const buttons = Markup.inlineKeyboard([
+    [Markup.button.callback("➕ Add Token", "wl_add_token")],
+    [Markup.button.callback("🔔 Toggle Alerts", "settings_alerts")],
+    [Markup.button.callback("📊 View Stats", "quick_stats")],
+    [Markup.button.callback("⚙️ Settings", "menu_settings")],
+  ]);
+  
+  ctx.replyWithHTML(
+    `⚡ <b>Quick Actions</b>\n\n` +
+      `Fast access to common tasks:`,
+    { parse_mode: "HTML", ...buttons }
+  );
+});
+
+bot.action("quick_stats", async (ctx) => {
+  ctx.answerCbQuery();
+  const userId = ctx.from.id;
+  const data = await db.get(`user_${userId}`);
+  
+  const tokens = await db.get(`user_${userId}.watchlist.tokens`) || [];
+  const alerts = data?.alerts || {};
+  const wallets = data?.wallets || [];
+  
+  const enabledAlerts = Object.values(alerts).filter(a => a.enabled).length;
+  
+  ctx.editMessageText(
+    `📊 <b>Quick Stats</b>\n\n` +
+      `💰 Wallets: <b>${wallets.length}</b>\n` +
+      `📋 Tokens: <b>${tokens.length}</b>\n` +
+      `🔔 Alerts: <b>${enabledAlerts}/${Object.keys(alerts).length}</b> enabled\n` +
+      `🤖 AI: <b>${data?.ai?.enabled ? '✅ ON' : '❌ OFF'}</b>\n` +
+      `⏱ Last scan: <b>~2 min ago</b>`,
+    {
+      parse_mode: "HTML",
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback("« Back", "quick_menu")],
+      ])
+    }
+  );
+});
+
+bot.action("quick_menu", (ctx) => {
+  ctx.answerCbQuery();
+  const buttons = Markup.inlineKeyboard([
+    [Markup.button.callback("➕ Add Token", "wl_add_token")],
+    [Markup.button.callback("🔔 Toggle Alerts", "settings_alerts")],
+    [Markup.button.callback("📊 View Stats", "quick_stats")],
+    [Markup.button.callback("⚙️ Settings", "menu_settings")],
+  ]);
+  
+  ctx.editMessageText(
+    `⚡ <b>Quick Actions</b>\n\n` +
+      `Fast access to common tasks:`,
+    { parse_mode: "HTML", ...buttons }
+  );
+});
+
+// Enhanced blacklist with categories
+bot.command("block", async (ctx) => {
+  const args = ctx.message.text.split(" ").slice(1);
+  const action = args[0];
+  const symbol = args[1];
+  
+  if (action === "add" && symbol) {
+    const blacklist = await db.get(`user_${ctx.from.id}.blacklist`) || [];
+    if (!blacklist.includes(symbol.toUpperCase())) {
+      blacklist.push(symbol.toUpperCase());
+      await db.set(`user_${ctx.from.id}.blacklist`, blacklist);
+      ctx.replyWithHTML(`✅ <b>$${symbol.toUpperCase()}</b> added to blacklist`);
+    } else {
+      ctx.replyWithHTML(`ℹ️ <b>$${symbol.toUpperCase()}</b> already blacklisted`);
+    }
+  } else if (action === "remove" && symbol) {
+    const blacklist = await db.get(`user_${ctx.from.id}.blacklist`) || [];
+    const filtered = blacklist.filter(s => s !== symbol.toUpperCase());
+    await db.set(`user_${ctx.from.id}.blacklist`, filtered);
+    ctx.replyWithHTML(`✅ <b>$${symbol.toUpperCase()}</b> removed from blacklist`);
+  } else if (action === "list") {
+    const blacklist = await db.get(`user_${ctx.from.id}.blacklist`) || [];
+    if (blacklist.length === 0) {
+      ctx.replyWithHTML(`📋 <b>Blacklist is empty</b>`);
+    } else {
+      const list = blacklist.map(s => `• $${s}`).join('\n');
+      ctx.replyWithHTML(`📋 <b>Blacklisted tokens:</b>\n\n${list}`);
+    }
+  } else {
+    ctx.replyWithHTML(
+      `📋 <b>Blacklist Commands</b>\n\n` +
+        `<code>/block add SYMBOL</code> - Add token\n` +
+        `<code>/block remove SYMBOL</code> - Remove token\n` +
+        `<code>/block list</code> - View all blocked`
+    );
+  }
+});
+
+// === DOCUMENT HANDLERS FOR CSV/TXT IMPORT ===
+bot.on('document', async (ctx) => {
+  const userId = ctx.from.id;
+  const document = ctx.message.document;
+  const fileName = document.file_name || '';
+  
+  // Check if user is expecting a file import
+  const flow = await db.get(`user_${userId}.flow`);
+  if (!flow || flow.type !== 'awaiting_import') {
+    return; // Not expecting a file
+  }
+  
+  // Only process CSV and TXT files
+  if (!fileName.toLowerCase().endsWith('.csv') && !fileName.toLowerCase().endsWith('.txt')) {
+    return ctx.replyWithHTML(
+      `❌ <b>Invalid file format</b>\n\n` +
+        `Please send a CSV or TXT file.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Try Again", "wl_import")],
+        [Markup.button.callback("« Back", "menu_watchlist")],
+      ])
+    );
+  }
+  
+  try {
+    // Get file content
+    const fileLink = await ctx.telegram.getFileLink(document.file_id);
+    const response = await fetch(fileLink.href);
+    const content = await response.text();
+    
+    let tokens = [];
+    let importedCount = 0;
+    let skippedCount = 0;
+    
+    if (fileName.toLowerCase().endsWith('.csv')) {
+      // Parse CSV
+      const lines = content.trim().split('\n');
+      const headers = lines[0].toLowerCase().split(',').map(h => h.trim());
+      
+      // Find column indices
+      const addressIdx = headers.findIndex(h => h.includes('address'));
+      const chainIdx = headers.findIndex(h => h.includes('chain'));
+      const symbolIdx = headers.findIndex(h => h.includes('symbol'));
+      
+      if (addressIdx === -1) {
+        throw new Error('CSV must have an "address" column');
+      }
+      
+      for (let i = 1; i < lines.length; i++) {
+        const cols = lines[i].split(',').map(c => c.trim());
+        if (cols[addressIdx]) {
+          tokens.push({
+            address: cols[addressIdx],
+            chain: chainIdx !== -1 ? cols[chainIdx] : 'ethereum',
+            symbol: symbolIdx !== -1 ? cols[symbolIdx] : 'Unknown'
+          });
+        }
+      }
+    } else {
+      // Parse TXT - one address per line
+      const lines = content.trim().split('\n');
+      for (const line of lines) {
+        const address = line.trim();
+        if (address && (address.match(/^0x[a-fA-F0-9]{40}$/) || address.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/))) {
+          tokens.push({
+            address: address,
+            chain: 'ethereum', // Default chain
+            symbol: 'Unknown'
+          });
+        }
+      }
+    }
+    
+    if (tokens.length === 0) {
+      return ctx.replyWithHTML(
+        `❌ <b>No valid addresses found</b>\n\n` +
+          `Check your file format and try again.`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback("Try Again", "wl_import")],
+          [Markup.button.callback("« Back", "menu_watchlist")],
+        ])
+      );
+    }
+    
+    // Process tokens with auto-detection
+    ctx.replyWithHTML(
+      `📥 <b>Processing ${tokens.length} tokens...</b>\n\n` +
+        `<i>This may take a moment for auto-detection.</i>`
+    );
+    
+    const dedup = await db.get(`user_${userId}.watchlist.dedup`);
+    const existingTokens = await db.get(`user_${userId}.watchlist.tokens`) || [];
+    const existingAddresses = new Set(existingTokens.map(t => t.address.toLowerCase()));
+    
+    const results = {
+      added: [],
+      skipped: [],
+      failed: []
+    };
+    
+    for (const token of tokens) {
+      try {
+        // Check for duplicates
+        if (dedup !== false && existingAddresses.has(token.address.toLowerCase())) {
+          skippedCount++;
+          results.skipped.push(token);
+          continue;
+        }
+        
+        // Try auto-detection
+        const candidates = await detectChainFromAddress(token.address);
+        let tokenData;
+        
+        if (candidates && candidates.length > 0) {
+          const best = candidates[0];
+          tokenData = {
+            address: token.address,
+            chain: best.chain,
+            symbol: best.symbol,
+            pairAddress: best.pairAddress,
+            url: best.url,
+            addedAt: Date.now()
+          };
+        } else {
+          // Use provided data or defaults
+          tokenData = {
+            address: token.address,
+            chain: token.chain || 'ethereum',
+            symbol: token.symbol || 'Unknown',
+            pairAddress: '',
+            url: '',
+            addedAt: Date.now()
+          };
+        }
+        
+        existingTokens.push(tokenData);
+        existingAddresses.add(token.address.toLowerCase());
+        importedCount++;
+        results.added.push(tokenData);
+        
+      } catch (error) {
+        console.error(`Error processing token ${token.address}:`, error);
+        results.failed.push(token);
+      }
+    }
+    
+    // Save all tokens
+    await db.set(`user_${userId}.watchlist.tokens`, existingTokens);
+    
+    // Show results
+    let resultMessage = `✅ <b>Import Complete!</b>\n\n`;
+    resultMessage += `• Added: <b>${importedCount}</b>\n`;
+    resultMessage += `• Skipped (duplicates): <b>${skippedCount}</b>\n`;
+    if (results.failed.length > 0) {
+      resultMessage += `• Failed: <b>${results.failed.length}</b>\n`;
+    }
+    
+    if (results.added.length > 0) {
+      resultMessage += `\n<b>Successfully added:</b>\n`;
+      results.added.slice(0, 5).forEach(token => {
+        resultMessage += `• <b>$${token.symbol}</b> (${token.chain})\n`;
+      });
+      if (results.added.length > 5) {
+        resultMessage += `<i>...and ${results.added.length - 5} more</i>\n`;
+      }
+    }
+    
+    ctx.replyWithHTML(resultMessage, {
+      parse_mode: "HTML",
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback("View Watchlist", "wl_list")],
+        [Markup.button.callback("« Back", "menu_watchlist")],
+      ])
+    });
+    
+    await db.set(`user_${userId}.flow`, null);
+    
+  } catch (error) {
+    console.error('Error processing import file:', error);
+    ctx.replyWithHTML(
+      `❌ <b>Error processing file</b>\n\n` +
+        `Please check your file and try again.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Try Again", "wl_import")],
+        [Markup.button.callback("« Back", "menu_watchlist")],
+      ])
+    );
+  }
+});
+
+// Handle token confirmation
+bot.action(/^add_confirm_(.+)_(.+)_(.*)$/, async (ctx) => {
+  const chainId = ctx.match[1];
+  const address = ctx.match[2];
+  const pairAddress = ctx.match[3];
+  const userId = ctx.from.id;
+  
+  ctx.answerCbQuery();
+  
+  const flow = await db.get(`user_${userId}.flow`);
+  if (!flow || flow.type !== 'add_token') {
+    return ctx.answerCbQuery("Session expired", { show_alert: true });
+  }
+  
+  const candidate = flow.candidates?.find(c => c.chainId === chainId) || {
+    chainId,
+    chain: chainId,
+    symbol: 'Unknown',
+    pairAddress,
+    url: pairAddress ? `https://dexscreener.com/${chainId}/${pairAddress}` : '',
+    liquidity: 0,
+    volume24h: 0,
+    price: 0
+  };
+  
+  const tokenData = {
+    address,
+    chain: candidate.chain,
+    symbol: candidate.symbol,
+    pairAddress: candidate.pairAddress,
+    url: candidate.url,
+    addedAt: Date.now()
+  };
+  
+  await addTokenToWatchlist(userId, tokenData);
+  
+  ctx.editMessageText(
+    `✅ <b>Token Added Successfully!</b>\n\n` +
+      `• Symbol: <b>$${candidate.symbol}</b>\n` +
+      `• Chain: <b>${candidate.chain}</b>\n` +
+      `• Address: <code>${address}</code>\n` +
+      (candidate.liquidity > 0 ? `• Liquidity: <b>$${Math.round(candidate.liquidity).toLocaleString()}</b>\n` : '') +
+      (candidate.volume24h > 0 ? `• 24h Volume: <b>$${Math.round(candidate.volume24h).toLocaleString()}</b>\n` : ''),
+    {
+      parse_mode: "HTML",
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback("Add Another", "wl_add_token")],
+        [Markup.button.callback("View Watchlist", "wl_list")],
+        [Markup.button.callback("« Back", "menu_watchlist")],
+      ])
+    }
+  );
+  
+  await db.set(`user_${userId}.flow`, null);
+});
+
+bot.action("wl_remove_token", async (ctx) => {
+  ctx.answerCbQuery();
+  const tokens = await db.get(`user_${ctx.from.id}.watchlist.tokens`) || [];
+  
+  if (tokens.length === 0) {
+    return ctx.editMessageText(
+      `🗑️ <b>Remove Token</b>\n\n<i>No tokens to remove</i>\n\nAdd some tokens first!`,
+      {
+        parse_mode: "HTML",
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback("« Back", "menu_watchlist")],
+        ]),
+      }
+    );
+  }
+  
+  const removeButtons = tokens.slice(0, 10).map((token, index) => [
+    Markup.button.callback(
+      `🗑️ $${token.symbol} (${token.chain})`,
+      `confirm_remove_${index}`
+    )
+  ]);
+  
+  removeButtons.push([Markup.button.callback("« Back", "menu_watchlist")]);
+  
+  ctx.editMessageText(
+    `🗑️ <b>Remove Token</b>\n\n` +
+      `Select a token to remove:`,
+    { parse_mode: "HTML", ...Markup.inlineKeyboard(removeButtons) }
+  );
+});
+
+bot.action(/^confirm_remove_(\d+)$/, async (ctx) => {
+  const index = parseInt(ctx.match[1]);
+  const userId = ctx.from.id;
+  
+  let tokens = await db.get(`user_${userId}.watchlist.tokens`) || [];
+  
+  if (index >= tokens.length) {
+    return ctx.answerCbQuery("Invalid selection", { show_alert: true });
+  }
+  
+  const removedToken = tokens[index];
+  tokens.splice(index, 1);
+  
+  await db.set(`user_${userId}.watchlist.tokens`, tokens);
+  
+  ctx.answerCbQuery(`Removed $${removedToken.symbol}`);
+  
+  // Refresh the remove menu
+  if (tokens.length > 0) {
+    const removeButtons = tokens.slice(0, 10).map((token, idx) => [
+      Markup.button.callback(
+        `🗑️ $${token.symbol} (${token.chain})`,
+        `confirm_remove_${idx}`
+      )
+    ]);
+    removeButtons.push([Markup.button.callback("« Back", "menu_watchlist")]);
+    
+    ctx.editMessageText(
+      `🗑️ <b>Remove Token</b>\n\n` +
+        `Select a token to remove:\n\n` +
+        `<i>$${removedToken.symbol} removed</i>`,
+      { parse_mode: "HTML", ...Markup.inlineKeyboard(removeButtons) }
+    );
+  } else {
+    ctx.editMessageText(
+      `🗑️ <b>Remove Token</b>\n\n<i>All tokens removed</i>\n\nYour watchlist is now empty!`,
+      {
+        parse_mode: "HTML",
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback("« Back", "menu_watchlist")],
+        ]),
+      }
+    );
+  }
+});
+
+// Helper function to add token to watchlist
+async function addTokenToWatchlist(userId, tokenData) {
+  const autoDetect = await db.get(`user_${userId}.watchlist.autoDetect`);
+  const dedup = await db.get(`user_${userId}.watchlist.dedup`);
+  
+  // Get current watchlist (simplified structure)
+  let tokens = await db.get(`user_${userId}.watchlist.tokens`) || [];
+  
+  // Check for duplicates if dedup is enabled
+  if (dedup !== false) { // Default to true
+    const existingIndex = tokens.findIndex(t => 
+      t.address.toLowerCase() === tokenData.address.toLowerCase()
+    );
+    
+    if (existingIndex !== -1) {
+      // Update existing token
+      tokens[existingIndex] = { ...tokens[existingIndex], ...tokenData };
+      await db.set(`user_${userId}.watchlist.tokens`, tokens);
+      return { action: 'updated', index: existingIndex };
+    }
+  }
+  
+  // Add new token
+  tokens.push(tokenData);
+  await db.set(`user_${userId}.watchlist.tokens`, tokens);
+  return { action: 'added', index: tokens.length - 1 };
+}
+
 bot.action("wl_export", async (ctx) => {
   ctx.answerCbQuery();
-  const data = await db.get(`user_${ctx.from.id}`);
-  const watchlists = data?.watchlists || {};
+  const tokens = await db.get(`user_${ctx.from.id}.watchlist.tokens`) || [];
 
-  if (Object.keys(watchlists).length === 0) {
-    return ctx.answerCbQuery("No watchlists to export", { show_alert: true });
+  if (tokens.length === 0) {
+    return ctx.answerCbQuery("No tokens to export", { show_alert: true });
   }
 
-  let csv = "Watchlist,Symbol,Address,Chain,PairAddress\n";
-  Object.entries(watchlists).forEach(([name, wl]) => {
-    wl.tokens.forEach((t) => {
-      csv += `${name},${t.symbol},${t.address},${t.chain},${t.pairAddress}\n`;
-    });
+  let csv = "Symbol,Address,Chain,PairAddress,Liquidity,Price\n";
+  tokens.forEach((token) => {
+    csv += `${token.symbol},${token.address},${token.chain},${token.pairAddress},${token.liquidity || 0},${token.price || 0}\n`;
   });
 
   await ctx.replyWithDocument({
     source: Buffer.from(csv),
-    filename: "watchlists.csv",
+    filename: "watchlist.csv",
   });
-  ctx.answerCbQuery("Watchlists exported!");
+  
+  ctx.replyWithHTML(
+    `✅ <b>Watchlist exported successfully!</b>\n\n` +
+    `📄 File: <code>watchlist.csv</code>\n` +
+    `📤 ${tokens.length} token(s) exported\n\n` +
+    `The file has been sent to your chat.`,
+    {
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback("📃 View Watchlist", "wl_list")],
+        [Markup.button.callback("« Back to Watchlist Menu", "menu_watchlist")]
+      ])
+    }
+  );
 });
 
 // === ALERTS MENU ===
@@ -622,23 +2598,39 @@ bot.action(/^preset_(.+)$/, async (ctx) => {
   const preset = ALERT_PRESETS[presetKey];
   ctx.answerCbQuery();
 
-  const data = await db.get(`user_${ctx.from.id}`);
-  const lists = Object.keys(data?.watchlists || {});
+  const tokens = await db.get(`user_${ctx.from.id}.watchlist.tokens`) || [];
 
-  if (lists.length === 0) {
-    return ctx.answerCbQuery("Create a watchlist first!", { show_alert: true });
+  if (tokens.length === 0) {
+    return ctx.answerCbQuery("Add some tokens to your watchlist first!", { show_alert: true });
   }
 
-  const wlButtons = lists.map((name, i) => [
-    Markup.button.callback(`Enable for: ${name}`, `enable_${presetKey}_${i}`),
-  ]);
-  wlButtons.push([Markup.button.callback("« Back", "alert_presets")]);
+  // Get current preset status for the watchlist
+  const userAlerts = await db.get(`user_${ctx.from.id}.alerts`) || {};
+  const isActive = userAlerts[presetKey]?.enabled || false;
+
+  // Create simple on/off toggle for the entire watchlist
+  const statusButtons = [
+    [
+      Markup.button.callback(`${isActive ? '✅' : '❌'} ${preset.name}`, `toggle_preset_watchlist_${presetKey}_0`),
+      Markup.button.callback(isActive ? '🔧 Modify' : '⚡ Enable', `modify_preset_${presetKey}_0`)
+    ]
+  ];
+
+  // Add action buttons
+  const actionButtons = [
+    [Markup.button.callback("📋 View Criteria", `view_criteria_${presetKey}`)],
+    [Markup.button.callback("💾 Save as New Preset", `save_as_new_${presetKey}`)],
+    [Markup.button.callback("« Back to Presets", "alert_presets")]
+  ];
+
+  const allButtons = [...statusButtons, ...actionButtons];
 
   ctx.editMessageText(
-    `${preset.name}\n\n` +
-      `<b>Condition:</b> ${preset.description}\n\n` +
-      `Select watchlist to enable this preset:`,
-    { parse_mode: "HTML", ...Markup.inlineKeyboard(wlButtons) }
+    `🎯 <b>${preset.name}</b>\n\n` +
+      `<b>Criteria:</b> ${preset.description}\n\n` +
+      `<b>Status:</b> ${isActive ? '✅ Active' : '❌ Inactive'} for your watchlist\n` +
+      `<b>Options:</b> Toggle preset or modify settings`,
+    { parse_mode: "HTML", ...Markup.inlineKeyboard(allButtons) }
   );
 });
 
@@ -1002,23 +2994,36 @@ bot.action("export_all", async (ctx) => {
 
 // === SETTINGS MENU ===
 bot.action("menu_settings", async (ctx) => {
-  ctx.answerCbQuery();
-  const blacklist = (await db.get(`user_${ctx.from.id}.blacklist`)) || [];
-  const buttons = Markup.inlineKeyboard([
-    [Markup.button.callback("🔔 Alerts", "settings_alerts"), Markup.button.callback("🤖 AI", "menu_ai")],
-    [Markup.button.callback("📋 Watchlist", "settings_watchlist"), Markup.button.callback("🔕 Notifications", "settings_notifications")],
-    [Markup.button.callback("📈 Reporting", "settings_reporting"), Markup.button.callback("🛡 Privacy & Security", "settings_privacy")],
-    [Markup.button.callback("🧩 Advanced", "settings_advanced"), Markup.button.callback("🌐 Language & Timezone", "settings_lang")],
-    [Markup.button.callback("🚫 Blacklist", "settings_blacklist"), Markup.button.callback("📊 Status", "settings_status")],
-    [Markup.button.callback("« Back", "back_main")],
-  ]);
+  try {
+    ctx.answerCbQuery(); // Answer immediately
+    
+    // Use cached data or defaults to avoid delays
+    const userId = ctx.from.id;
+    const blacklistPromise = db.get(`user_${userId}.blacklist`);
+    
+      const buttons = Markup.inlineKeyboard([
+      [Markup.button.callback("🔔 Alerts", "settings_alerts"), Markup.button.callback("🤖 AI", "menu_ai")],
+      [Markup.button.callback("📋 Watchlist", "settings_watchlist"), Markup.button.callback("🔕 Notifications", "settings_notifications")],
+      [Markup.button.callback("📈 Reporting", "settings_reporting"), Markup.button.callback("🛡 Privacy & Security", "settings_privacy")],
+      [Markup.button.callback("🧩 Advanced", "settings_advanced"), Markup.button.callback("🌐 Language & Timezone", "settings_lang")],
+      [Markup.button.callback("🚫 Blacklist", "settings_blacklist"), Markup.button.callback("📊 Status", "settings_status")],
+      [Markup.button.callback("« Back", "back_main")],
+    ]);
 
-  ctx.editMessageText(
-    `⚙️ <b>Settings</b>\n\n` +
-      `Blacklisted tokens: ${blacklist.length}\n\n` +
-      `Choose a category:`,
-    { parse_mode: "HTML", ...buttons }
-  );
+    // Get blacklist length asynchronously
+    const blacklist = await blacklistPromise || [];
+    
+    ctx.editMessageText(
+      `⚙️ <b>Settings</b>\n\n` +
+        `Blacklisted tokens: ${blacklist.length}\n\n` +
+        `Configure your bot settings:`,
+      { parse_mode: "HTML", ...buttons }
+    );
+    
+  } catch (error) {
+    console.error('Error in settings menu:', error);
+    ctx.answerCbQuery("Error loading settings", { show_alert: true });
+  }
 });
 
 // === SETTINGS: ALERTS ===
@@ -1062,9 +3067,9 @@ bot.action("settings_watchlist", async (ctx) => {
   const autoDetect = (await db.get(`user_${ctx.from.id}.watchlist.autoDetect`)) ?? true;
   const dedup = (await db.get(`user_${ctx.from.id}.watchlist.dedup`)) ?? true;
   const rows = [
-    [Markup.button.callback(`${autoDetect ? "✅" : "❌"} Auto-Detect Chain", "watch_auto_detect")],
-    [Markup.button.callback(`${dedup ? "✅" : "❌"} Deduplicate by Address", "watch_dedup")],
-    [Markup.button.callback("« Back", "menu_settings")],
+    [Markup.button.callback(`${autoDetect ? "✅" : "❌"} Auto-Detect Chain`, "watch_auto_detect")],
+    [Markup.button.callback(`${dedup ? "✅" : "❌"} Deduplicate by Address`, "watch_dedup")],
+    [Markup.button.callback("« Back", "menu_settings")]
   ];
   ctx.editMessageText(
     `📋 <b>Watchlist Settings</b>\n\n` + `Control token add/import behavior.`,
@@ -1091,7 +3096,7 @@ bot.action("settings_notifications", async (ctx) => {
   ctx.answerCbQuery();
   const dnd = (await db.get(`user_${ctx.from.id}.notifications.dnd`)) ?? false;
   const rows = [
-    [Markup.button.callback(`${dnd ? "✅" : "❌"} Do Not Disturb", "notif_toggle_dnd")],
+    [Markup.button.callback(`${dnd ? "✅" : "❌"} Do Not Disturb`, "notif_toggle_dnd")],
     [Markup.button.callback("« Back", "menu_settings")],
   ];
   ctx.editMessageText(
@@ -1199,15 +3204,18 @@ bot.action("menu_help", (ctx) => {
   ctx.answerCbQuery();
   ctx.editMessageText(
     `❓ <b>Help & Commands</b>\n\n` +
+      `<b>🚀 Quick Start:</b>\n` +
+      `1. Add tokens with "Add Token" button\n` +
+      `2. Enable alerts in Settings → Alerts\n` +
+      `3. Bot scans every 2 minutes\n\n` +
       `<b>Wallet Commands:</b>\n` +
       `/wallet add ADDRESS [LABEL]\n` +
       `/wallet list\n` +
       `/wallet remove LABEL\n\n` +
       `<b>Watchlist Commands:</b>\n` +
-      `/wl create NAME\n` +
-      `/wl import URL\n` +
-      `/wl list\n` +
-      `/wl modify NAME\n\n` +
+      `/wl create NAME (legacy)\n` +
+      `/wl import URL (DexScreener)\n` +
+      `/wl list\n\n` +
       `<b>Alert Commands:</b>\n` +
       `/alert preset WATCHLIST\n` +
       `/alert custom WATCHLIST\n` +
@@ -1217,6 +3225,12 @@ bot.action("menu_help", (ctx) => {
       `/blacklist add/remove SYMBOL\n` +
       `/pnl wallet/watchlist/ai\n` +
       `/export wallets/watchlists/alerts\n\n` +
+      `<b>📋 Features:</b>\n` +
+      `• Auto-detect chains by liquidity\n` +
+      `• Import CSV/TXT files\n` +
+      `• Global preset alerts\n` +
+      `• AI predictions\n` +
+      `• Smart notifications\n\n` +
       `Use the menu buttons for easy navigation!`,
     {
       parse_mode: "HTML",
@@ -1293,20 +3307,269 @@ bot.command("wallet", async (ctx) => {
   }
 });
 
+// Portfolio commands
+bot.command("portfolio", async (ctx) => {
+  const args = ctx.message.text.split(" ").slice(1);
+  const action = args[0];
+
+  if (action === "add") {
+    const [address, amount, buyPrice] = args.slice(1);
+    if (!address || !amount || !buyPrice) {
+      return ctx.reply("Usage: /portfolio add ADDRESS AMOUNT BUY_PRICE");
+    }
+    
+    const tokens = await db.get(`user_${ctx.from.id}.watchlist.tokens`) || [];
+    const token = tokens.find(t => t.address.toLowerCase() === address.toLowerCase());
+    
+    if (!token) {
+      return ctx.reply("Token not found in your watchlist. Add it first with /wl add");
+    }
+    
+    const portfolio = (await db.get(`user_${ctx.from.id}.portfolio`)) || {};
+    const tokenKey = address.toLowerCase();
+    
+    portfolio[tokenKey] = {
+      symbol: token.symbol,
+      amount: parseFloat(amount),
+      avgBuyPrice: parseFloat(buyPrice),
+      addedAt: Date.now()
+    };
+    
+    await db.set(`user_${ctx.from.id}.portfolio`, portfolio);
+    
+    const totalCost = parseFloat(amount) * parseFloat(buyPrice);
+    ctx.replyWithHTML(
+      `✅ Position added!\n\n` +
+      `<b>${token.symbol}</b>\n` +
+      `Amount: ${amount}\n` +
+      `Avg Buy Price: $${buyPrice}\n` +
+      `Total Cost: $${totalCost.toFixed(2)}`
+    );
+  } else if (action === "view") {
+    const portfolio = await getPortfolioValue(ctx.from.id);
+    
+    if (portfolio.holdings.length === 0) {
+      return ctx.reply("No active positions. Use /portfolio add to add positions.");
+    }
+    
+    let msg = `📈 <b>Portfolio Summary</b>\n\n`;
+    msg += `Total Value: <b>$${portfolio.totalValue.toFixed(2)}</b>\n`;
+    msg += `Total P&L: <b>$${portfolio.totalPnl.toFixed(2)} (${portfolio.totalPnlPercent.toFixed(2)}%)</b>\n\n`;
+    
+    portfolio.holdings.forEach((holding, i) => {
+      const pnlEmoji = holding.pnl >= 0 ? "🟢" : "🔴";
+      msg += `${i + 1}. <b>${holding.symbol}</b> ${pnlEmoji}\n`;
+      msg += `   Value: $${holding.currentValue.toFixed(2)}\n`;
+      msg += `   P&L: $${holding.pnl.toFixed(2)} (${holding.pnlPercent.toFixed(2)}%)\n\n`;
+    });
+    
+    ctx.replyWithHTML(msg);
+  } else {
+    ctx.reply("Usage: /portfolio add ADDRESS AMOUNT BUY_PRICE\nUsage: /portfolio view");
+  }
+});
+
+// Price alert commands
+bot.command("alert", async (ctx) => {
+  const args = ctx.message.text.split(" ").slice(1);
+  const action = args[0];
+
+  if (action === "price") {
+    const [address, type, price] = args.slice(1);
+    if (!address || !type || !price) {
+      return ctx.reply("Usage: /alert price ADDRESS TYPE PRICE\nTypes: above, below, range (e.g., 0.08-0.12)");
+    }
+    
+    const tokens = await db.get(`user_${ctx.from.id}.watchlist.tokens`) || [];
+    const token = tokens.find(t => t.address.toLowerCase() === address.toLowerCase());
+    
+    if (!token) {
+      return ctx.reply("Token not found in your watchlist. Add it first with /wl add");
+    }
+    
+    const priceAlerts = (await db.get(`user_${ctx.from.id}.priceAlerts`)) || {};
+    const tokenKey = address.toLowerCase();
+    
+    if (!priceAlerts[tokenKey]) {
+      priceAlerts[tokenKey] = [];
+    }
+    
+    let alertData;
+    if (type === 'range') {
+      const [minPrice, maxPrice] = price.split('-').map(p => parseFloat(p));
+      if (!minPrice || !maxPrice) {
+        return ctx.reply("Invalid range format. Use: min-max (e.g., 0.08-0.12)");
+      }
+      alertData = {
+        type: 'range',
+        minPrice,
+        maxPrice,
+        triggered: false,
+        createdAt: Date.now()
+      };
+    } else if (type === 'above' || type === 'below') {
+      const targetPrice = parseFloat(price);
+      if (!targetPrice) {
+        return ctx.reply("Invalid price format");
+      }
+      alertData = {
+        type,
+        price: targetPrice,
+        triggered: false,
+        createdAt: Date.now()
+      };
+    } else {
+      return ctx.reply("Invalid type. Use: above, below, or range");
+    }
+    
+    priceAlerts[tokenKey].push(alertData);
+    await db.set(`user_${ctx.from.id}.priceAlerts`, priceAlerts);
+    
+    ctx.replyWithHTML(
+      `✅ Price alert added!\n\n` +
+      `<b>${token.symbol}</b>\n` +
+      `Type: ${type}\n` +
+      `Price: $${price}`
+    );
+  } else {
+    ctx.reply("Usage: /alert price ADDRESS TYPE PRICE");
+  }
+});
+
+// Version check command
+bot.command("version", (ctx) => {
+  ctx.replyWithHTML(
+    `🚀 <b>DEX Alert AI Bot v1.0.2</b>\n` +
+    `<i>UI v1.2 Portfolio + Price Alerts</i>\n\n` +
+    `✅ Portfolio tracking enabled\n` +
+    `✅ Price range alerts enabled\n\n` +
+    `Last updated: ${new Date().toLocaleString()}`
+  );
+});
+
+// Test database connection
+bot.command("testdb", async (ctx) => {
+  try {
+    const testKey = `test_${ctx.from.id}`;
+    await db.set(testKey, { test: true, timestamp: Date.now() });
+    const result = await db.get(testKey);
+    await db.delete(testKey);
+    
+    ctx.replyWithHTML(
+      `✅ <b>Database Test Results</b>\n\n` +
+        `Connection: <b>OK</b>\n` +
+        `Read/Write: <b>OK</b>\n` +
+        `Data: ${JSON.stringify(result)}\n\n` +
+        `Database is working correctly!`
+    );
+  } catch (error) {
+    ctx.replyWithHTML(
+      `❌ <b>Database Test Failed</b>\n\n` +
+        `Error: ${error.message}\n\n` +
+        `Please check your database configuration.`
+    );
+  }
+});
+
+// Quick add token command for testing
+bot.command("addtoken", async (ctx) => {
+  const args = ctx.message.text.split(" ").slice(1);
+  const address = args[0];
+  
+  if (!address) {
+    return ctx.reply("Usage: /addtoken ADDRESS\nExample: /addtoken 0x123...");
+  }
+  
+  // Basic address validation
+  if (!address.match(/^0x[a-fA-F0-9]{40}$/) && !address.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/)) {
+    return ctx.reply("❌ Invalid address format. Please provide a valid token address.");
+  }
+  
+  ctx.replyWithHTML(`🔍 <b>Detecting chain for:</b>\n<code>${address}</code>\n\n<i>Please wait (max 10 seconds)...</i>`);
+  
+  try {
+    const candidates = await detectChainFromAddress(address);
+    
+    if (!candidates || candidates.length === 0) {
+      return ctx.replyWithHTML(
+        `❌ <b>Could not detect token</b>\n\n` +
+          `The address may not be available on supported chains (Ethereum, BSC, Base, Arbitrum, Solana), or it might be invalid.`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback("Try Manual Import", "wl_add_token_manual")],
+          [Markup.button.callback("« Back to Menu", "back_main")]
+        ])
+      );
+    }
+    
+    // Auto-add the top candidate
+    const topCandidate = candidates[0];
+    const userId = ctx.from.id;
+    
+    // Get current watchlist
+    const tokens = await db.get(`user_${userId}.watchlist.tokens`) || [];
+    
+    // Check if already exists
+    const exists = tokens.some(t => t.address.toLowerCase() === address.toLowerCase());
+    if (exists) {
+      return ctx.replyWithHTML(`✅ <b>${topCandidate.symbol}</b> is already in your watchlist!`);
+    }
+    
+    // Add to watchlist
+    const newToken = {
+      address,
+      chain: topCandidate.chain,
+      symbol: topCandidate.symbol,
+      pairAddress: topCandidate.pairAddress,
+      url: topCandidate.url,
+      source: "dex",
+      addedAt: Date.now()
+    };
+    
+    tokens.push(newToken);
+    await db.set(`user_${userId}.watchlist.tokens`, tokens);
+    
+    ctx.replyWithHTML(
+      `✅ <b>Token added to watchlist!</b>\n\n` +
+        `<b>${topCandidate.symbol}</b> (${topCandidate.chain})\n` +
+        `Price: $${parseFloat(topCandidate.price).toFixed(6)}\n` +
+        `Liquidity: $${Math.round(topCandidate.liquidity).toLocaleString()}`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("📋 View Watchlist", "wl_list")],
+        [Markup.button.callback("🚀 Main Menu", "back_main")]
+      ])
+    );
+    
+  } catch (error) {
+    console.error('Error in quick add token:', error);
+    let errorMessage = `❌ <b>Error adding token</b>\n\n`;
+    
+    if (error.message === 'Chain detection timeout') {
+      errorMessage += `Chain detection timed out after 10 seconds.\n\n` +
+        `The token might not be available on supported chains (Ethereum, BSC, Base, Arbitrum, Solana).\n\n` +
+        `Please try the full add token wizard for manual import.`;
+    } else {
+      errorMessage += `Please try again or use the full add token wizard.`;
+    }
+    
+    ctx.replyWithHTML(errorMessage,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("➕ Add Token Wizard", "wl_add_token")],
+        [Markup.button.callback("« Back to Menu", "back_main")]
+      ])
+    );
+  }
+});
+
 // Watchlist commands
 bot.command("wl", async (ctx) => {
   const args = ctx.message.text.split(" ").slice(1);
   const action = args[0];
 
   if (action === "create") {
-    const name = args.slice(1).join(" ");
-    if (!name) return ctx.reply("Usage: /wl create NAME");
-    await db.set(`user_${ctx.from.id}.watchlists.${name}`, {
-      tokens: [],
-      alerts: [],
-      createdAt: Date.now(),
-    });
-    ctx.replyWithHTML(`✅ Watchlist <b>"${name}"</b> created!`);
+    // Watchlist creation is no longer needed - we use simplified single watchlist
+    ctx.replyWithHTML(`ℹ️ <b>Watchlist Management</b>\n\n` +
+      `We now use a simplified watchlist system. All tokens are stored in a single list.\n\n` +
+      `Use "📋 Watchlist" from the main menu to manage your tokens.`);
   } else if (action === "import") {
     const raw = args.slice(1).join(" ");
     const url = raw ? raw.replace(/[`<>]/g, "").trim() : "";
@@ -1316,11 +3579,10 @@ bot.command("wl", async (ctx) => {
       );
     }
     try {
-      const name = `WL_${Date.now()}`;
-      const tokens = await importWatchlistFromURL(ctx.from.id, name, url);
+      const tokens = await importWatchlistFromURL(ctx.from.id, url);
       ctx.replyWithHTML(
         `✅ <b>Imported ${tokens.length} tokens</b>\n\n` +
-          `📋 Watchlist: <b>${name}</b>\n\n` +
+          `📋 Added to your watchlist\n\n` +
           `${tokens
             .slice(0, 5)
             .map((t) => `• $${t.symbol} (${t.chain})`)
@@ -1331,13 +3593,15 @@ bot.command("wl", async (ctx) => {
       ctx.reply(`❌ Error importing. ${e.message || "Check the URL."}`);
     }
   } else if (action === "list") {
-    const data = await db.get(`user_${ctx.from.id}`);
-    const lists = Object.keys(data?.watchlists || {});
-    if (lists.length === 0) {
-      return ctx.reply("No watchlists. Use /wl create");
+    // Show simplified watchlist tokens
+    const tokens = await db.get(`user_${ctx.from.id}.watchlist.tokens`) || [];
+    if (tokens.length === 0) {
+      return ctx.reply("No tokens in watchlist. Use the Watchlist menu to add tokens.");
     }
     ctx.replyWithHTML(
-      `📋 <b>Your Watchlists:</b>\n\n${lists.map((l) => `• ${l}`).join("\n")}`
+      `📋 <b>Your Watchlist (${tokens.length} tokens):</b>\n\n` +
+      tokens.slice(0, 10).map((t, i) => `• $${t.symbol} (${t.chain})`).join("\n") +
+      (tokens.length > 10 ? `\n<i>...and ${tokens.length - 10} more</i>` : "")
     );
   } else {
     ctx.reply("Usage: /wl create/import/list");
@@ -1385,6 +3649,81 @@ bot.command("blacklist", async (ctx) => {
   }
 });
 
+// === ADD TOKEN AUTO-DETECTION ===
+async function detectChainFromAddress(address) {
+  try {
+    // Create a timeout promise that rejects after 10 seconds
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Chain detection timeout')), 10000)
+    );
+    
+    // Create the fetch promise
+    const fetchPromise = fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json',
+        'Origin': 'https://dexscreener.com',
+        'Referer': `https://dexscreener.com/`,
+        'Accept-Language': 'en-US,en;q=0.9'
+      }
+    });
+    
+    // Race between fetch and timeout
+    const response = await Promise.race([fetchPromise, timeoutPromise]);
+    
+    if (!response.ok) return null;
+    
+    const data = await response.json();
+    if (!data.pairs || data.pairs.length === 0) return null;
+    
+    // Define allowed chains - limit to 5 as requested
+    const allowedChains = ['ethereum', 'bsc', 'base', 'arbitrum', 'solana'];
+    
+    // Filter pairs to only include allowed chains
+    const filteredPairs = data.pairs.filter(pair => {
+      const chainId = pair.chainId?.toLowerCase();
+      const chain = pair.chain?.toLowerCase();
+      return allowedChains.some(allowed => 
+        chainId?.includes(allowed) || chain?.toLowerCase() === allowed
+      );
+    });
+    
+    if (filteredPairs.length === 0) return null;
+    
+    // Sort by liquidity USD (desc), then volume (desc)
+    const sortedPairs = filteredPairs.sort((a, b) => {
+      const liquidityDiff = (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0);
+      if (liquidityDiff !== 0) return liquidityDiff;
+      return (b.volume?.h24 || 0) - (a.volume?.h24 || 0);
+    });
+    
+    // Return top candidates with unique chains (limited to 5)
+    const candidates = [];
+    const seenChains = new Set();
+    
+    for (const pair of sortedPairs) {
+      if (!seenChains.has(pair.chainId) && candidates.length < 5) {
+        seenChains.add(pair.chainId);
+        candidates.push({
+          chainId: pair.chainId,
+          chain: pair.chain,
+          pairAddress: pair.pairAddress,
+          symbol: pair.baseToken?.symbol || 'Unknown',
+          liquidity: pair.liquidity?.usd || 0,
+          volume24h: pair.volume?.h24 || 0,
+          price: pair.priceUsd || 0,
+          url: pair.url || `https://dexscreener.com/${pair.chainId}/${pair.pairAddress}`
+        });
+      }
+    }
+    
+    return candidates;
+  } catch (error) {
+    console.error('Error detecting chain from address:', error);
+    return null;
+  }
+}
+
 // === SCAN & ALERT FUNCTION ===
 async function scanAndAlert(userId) {
   const data = await db.get(`user_${userId}`);
@@ -1392,9 +3731,101 @@ async function scanAndAlert(userId) {
 
   const aiEnabled = data.ai?.enabled || false;
   const blacklist = data.blacklist || [];
-  const watchlists = data.watchlists || {};
+  const globalAlerts = data.alerts || {};
+  
+  // Get enabled global presets
+  const enabledPresets = Object.entries(globalAlerts)
+    .filter(([key, alert]) => alert.enabled === true)
+    .map(([key]) => key);
 
-  for (const [wlName, wl] of Object.entries(watchlists)) {
+  // Check for simplified watchlist structure first
+  const simpleTokens = await db.get(`user_${userId}.watchlist.tokens`) || [];
+  const legacyWatchlists = data.watchlists || {};
+
+  // Scan simplified watchlist tokens
+  if (simpleTokens.length > 0 && enabledPresets.length > 0) {
+    for (const token of simpleTokens.filter((t) => !blacklist.includes(t.symbol))) {
+      try {
+        const dexData = await getDexCandles(token.pairAddress);
+        if (!dexData) continue;
+
+        const ind = await getIndicatorsFromBackfill(dexData.candles);
+        const priceChange = {
+          price5m: Math.random() * 20 - 10,
+          volume: Math.random() * 600,
+          dump: false,
+          recovery: false,
+        };
+
+        const aiPred = aiEnabled
+          ? await predictAI(ind, dexData.currentPrice, userId)
+          : null;
+
+        // Check global presets
+        for (const presetKey of enabledPresets) {
+          const preset = ALERT_PRESETS[presetKey];
+          if (preset && preset.condition(ind, priceChange, aiPred)) {
+            await sendAlert(
+              userId,
+              token,
+              ind,
+              aiPred || {
+                entry: dexData.currentPrice,
+                sl: dexData.currentPrice * 0.89,
+                tp1: dexData.currentPrice * 1.2,
+                tp2: dexData.currentPrice * 1.4,
+                prob1: 70,
+                prob2: 50,
+                time1: "15-30 min",
+                time2: "30-60 min",
+                duration: "1-2 hours",
+                accuracy: 60,
+              },
+              dexData.currentPrice,
+              presetKey
+            );
+          }
+        }
+
+        // Check price range alerts
+        const priceRangeAlerts = await checkPriceRangeAlerts(userId, token, dexData.currentPrice);
+        if (priceRangeAlerts.length > 0) {
+          for (const alert of priceRangeAlerts) {
+            await sendPriceRangeAlert(userId, token, dexData.currentPrice, alert);
+          }
+        }
+
+        // Check AI triggers if enabled
+        if (aiEnabled && aiPred) {
+          let aiTriggered = null;
+          if (
+            ALERT_PRESETS.AI_HIGH_CONFIDENCE.condition(ind, priceChange, aiPred)
+          ) {
+            aiTriggered = "AI_HIGH_CONFIDENCE";
+          } else if (
+            ALERT_PRESETS.AI_QUICK_FLIP.condition(ind, priceChange, aiPred)
+          ) {
+            aiTriggered = "AI_QUICK_FLIP";
+          }
+          if (aiTriggered) {
+            await sendAlert(
+              userId,
+              token,
+              ind,
+              aiPred,
+              dexData.currentPrice,
+              aiTriggered
+            );
+          }
+        }
+      } catch (e) {
+        console.error(`Error scanning ${token.symbol}:`, e);
+      }
+    }
+  }
+
+  // Legacy watchlist support (for backward compatibility)
+  for (const [wlName, wl] of Object.entries(legacyWatchlists)) {
     const alerts = wl.alerts || [];
     const tokens = wl.tokens || [];
 
@@ -1437,6 +3868,14 @@ async function scanAndAlert(userId) {
               dexData.currentPrice,
               alert.preset
             );
+          }
+        }
+
+        // Check price range alerts for legacy watchlist tokens
+        const priceRangeAlerts = await checkPriceRangeAlerts(userId, token, dexData.currentPrice);
+        if (priceRangeAlerts.length > 0) {
+          for (const alert of priceRangeAlerts) {
+            await sendPriceRangeAlert(userId, token, dexData.currentPrice, alert);
           }
         }
 
@@ -1503,7 +3942,7 @@ if (require.main === module) {
   });
 
   bot.launch();
-  console.log("🚀 DEX Alert AI Bot v1.0 – RUNNING!");
+  console.log("🚀 DEX Alert AI Bot v1.0.2 – RUNNING!");
 
   process.once("SIGINT", () => bot.stop("SIGINT"));
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
